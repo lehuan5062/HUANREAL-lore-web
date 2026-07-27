@@ -76,26 +76,35 @@ async function apiStream(path, payload, onEvent) {
 }
 
 function toast(msg, isErr) {
-  const t = $("#toast");
-  t.textContent = msg;
-  t.className = "toast" + (isErr ? " err" : "");
-  t.hidden = false;
+  const container = $("#toast-container");
 
-  // Remove any existing close button
-  const existingBtn = t.querySelector(".toast-close");
-  if (existingBtn) existingBtn.remove();
+  const el = document.createElement("div");
+  el.className = "toast" + (isErr ? " err" : "");
+
+  const text = document.createElement("span");
+  text.className = "toast-msg";
+  text.textContent = msg;
+  el.appendChild(text);
+
+  const dismiss = () => el.remove();
 
   if (isErr) {
-    // For errors, add a close button instead of auto-dismiss
+    // Errors persist until manually dismissed.
     const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
     closeBtn.className = "toast-close";
     closeBtn.textContent = "✕";
-    closeBtn.onclick = () => (t.hidden = true);
-    t.appendChild(closeBtn);
+    closeBtn.setAttribute("aria-label", "Dismiss");
+    closeBtn.onclick = dismiss;
+    el.appendChild(closeBtn);
   } else {
-    // Success/info messages auto-dismiss
-    setTimeout(() => (t.hidden = true), 2500);
+    // Success/info toasts auto-dismiss.
+    setTimeout(dismiss, 2500);
   }
+
+  // column-reverse stacks the first DOM child at the bottom (anchor); prepending
+  // keeps the newest toast closest to the anchor and pushes older ones upward.
+  container.prepend(el);
 }
 
 async function loadRepos(attempt = 0) {
