@@ -71,7 +71,22 @@ function toast(msg, isErr) {
   t.textContent = msg;
   t.className = "toast" + (isErr ? " err" : "");
   t.hidden = false;
-  setTimeout(() => (t.hidden = true), isErr ? 5000 : 2500);
+
+  // Remove any existing close button
+  const existingBtn = t.querySelector(".toast-close");
+  if (existingBtn) existingBtn.remove();
+
+  if (isErr) {
+    // For errors, add a close button instead of auto-dismiss
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "toast-close";
+    closeBtn.textContent = "✕";
+    closeBtn.onclick = () => (t.hidden = true);
+    t.appendChild(closeBtn);
+  } else {
+    // Success/info messages auto-dismiss
+    setTimeout(() => (t.hidden = true), 2500);
+  }
 }
 
 async function loadRepos(attempt = 0) {
