@@ -13,21 +13,14 @@
 import { lore, LoreError } from "@lore-vcs/sdk";
 import { LoreEventTag, LoreLogLevel } from "@lore-vcs/sdk/types/enums";
 import { log } from "./log.mjs";
+import { LoreVerbError } from "./errors.mjs";
 
-/** A normalized Lore event: numeric tag resolved to its name plus the payload. */
-/** @typedef {{ tag: string, tagRaw: number, data: any }} LoreEvt */
+// Re-exported so importers of this module keep getting the symbol from here.
+// The class itself lives in errors.mjs (which imports nothing) so index.mjs can
+// use `instanceof LoreVerbError` without loading the native library.
+export { LoreVerbError };
 
-/** Raised when a Lore verb completes with a non-zero status. */
-export class LoreVerbError extends Error {
-  /** @param {string} message @param {{status?: number, code?: number, verb?: string}} [info] */
-  constructor(message, info = {}) {
-    super(message);
-    this.name = "LoreVerbError";
-    this.status = info.status ?? -1;
-    this.code = info.code ?? info.status ?? -1;
-    this.verb = info.verb;
-  }
-}
+/** @typedef {import("./errors.mjs").LoreEvt} LoreEvt */
 
 const TAG_NAME = /** @type {Record<number, string>} */ (LoreEventTag);
 

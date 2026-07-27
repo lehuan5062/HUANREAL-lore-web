@@ -74,7 +74,7 @@ function toast(msg, isErr) {
   setTimeout(() => (t.hidden = true), isErr ? 5000 : 2500);
 }
 
-async function loadRepos() {
+async function loadRepos(attempt = 0) {
   try {
     if (state.repos.length === 0) {
       const ul = $("#repo-list");
@@ -88,6 +88,19 @@ async function loadRepos() {
     state.reposEnriching = !!enriching;
     renderRepos();
   } catch (err) {
+    // The server binds its port before the native library finishes loading, so
+    // the very first request after launch can land while it is still coming up.
+    // Nothing else retries this one — the 10s poll is gated on an active repo —
+    // so without a bounded retry here the skeleton rows shimmer forever.
+    if (attempt < 4) {
+      setTimeout(() => loadRepos(attempt + 1), 300 * 2 ** attempt);
+      return;
+    }
+    // Out of retries: clear the skeletons so the sidebar reads honestly empty
+    // rather than looking like it is still loading.
+    state.repos = [];
+    state.reposEnriching = false;
+    renderRepos();
     toast(err.message, true);
   }
 }

@@ -11,7 +11,14 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
 import { log } from "./log.mjs";
-import { collect, stream, configureSdk, shutdownSdk, LoreVerbError } from "./sdk.mjs";
+// Lazy wrappers, NOT ./sdk.mjs directly: importing that would load the 29 MB
+// native library before this module's body — and so before listen(). See
+// sdk-lazy.mjs. LoreVerbError comes from errors.mjs (zero imports) so
+// `instanceof` works without pulling the SDK in.
+import { collect, stream, preloadSdk, shutdownSdk } from "./sdk-lazy.mjs";
+import { LoreVerbError } from "./errors.mjs";
+import { sinceLaunch } from "./launch.mjs";
+// Pure frozen enums — this subpath has no imports of its own and does not touch koffi.
 import { LoreErrorCode } from "@lore-vcs/sdk/types/enums";
 import * as store from "./store.mjs";
 import * as xform from "./transforms.mjs";
@@ -818,7 +825,7 @@ async function resetFiles(rp, paths) {
  * @param {string} verb such as "fileDiff"
  * @param {string|null} repoPath the repo, or null for a repo-less read
  * @param {Record<string, unknown>} args verb-specific arguments
- * @returns {Promise<import("./sdk.mjs").LoreEvt[]>}
+ * @returns {Promise<import("./errors.mjs").LoreEvt[]>}
  */
 async function collectRead(verb, repoPath, args) {
   if (!repoPath) return collect(verb, {}, args);
@@ -866,10 +873,17 @@ async function streamOp(res, verb, globalArgs, args, repoPath) {
   log.info("stream op finished", { verb, ok });
 }
 
+/** One-shot flag for the startup timing below. */
+let servedFirstRequest = false;
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const p = url.pathname;
+    if (!servedFirstRequest) {
+      servedFirstRequest = true;
+      log.debug("startup: first request served", { path: p, sinceLaunchMs: sinceLaunch() });
+    }
     const q = url.searchParams;
     const repoPath = q.get("path");
 
@@ -1158,7 +1172,7 @@ function startWatchers() {
 function warmRepoCache() {
   const startedAt = Date.now();
   enrichRepos()
-    .then(() => log.debug("repo cache warmed", { ms: Date.now() - startedAt }))
+    .then(() => log.debug("startup: repo cache warmed", { ms: Date.now() - startedAt, sinceLaunchMs: sinceLaunch() }))
     .catch((err) => log.debug("repo cache warmup failed", { message: err instanceof Error ? err.message : String(err) }));
 }
 
@@ -1171,11 +1185,44 @@ server.on("error", (err) => {
   process.exit(1);
 });
 
-configureSdk();
-startWatchers();
-warmRepoCache();
+/** Resolves once the port is bound; awaited by start.mjs to time the browser open. */
+let onListening;
+const whenListening = new Promise((resolve) => {
+  onListening = resolve;
+});
+
+log.debug("startup: modules loaded (sdk deferred)", { sinceLaunchMs: sinceLaunch() });
+
+// STARTUP ORDER IS THE WHOLE POINT (see sdk-lazy.mjs for the why). Nothing that
+// can block goes before listen(): binding the port is what lets start.mjs open
+// the browser, and the browser's own cold start is seconds we want to spend
+// concurrently with loading the native library rather than after it.
+//
+// Serving is fully useful during that window: web/index.html is a complete
+// static shell, and the cold path of GET /api/repos — the SPA's only initial API
+// call — reads the tracked-repo JSON and checks for .lore dirs with plain fs, no
+// SDK. Live branch/organization data arrives later via the "enriched" SSE refresh.
 server.listen(PORT, HOST, () => {
-  log.info("lore-web listening", { url: `http://${HOST}:${PORT}` });
+  log.info("lore-web listening", { url: `http://${HOST}:${PORT}`, sinceLaunchMs: sinceLaunch() });
+
+  // Cheap (two fs.watch per tracked repo), but still after listen: no request
+  // depends on watchers existing, so they don't belong ahead of the bind.
+  startWatchers();
+
+  // koffi.load() is SYNCHRONOUS — while it runs, this process serves nothing.
+  // Deferring it by a timer tick is what makes the overlap deterministic rather
+  // than incidental: start.mjs awaits `whenListening`, and promise continuations
+  // are microtasks, which always drain before the timer phase. So the browser is
+  // guaranteed to be spawned before this blocks. spawn() creates the process
+  // synchronously, so from there the browser's cold start and the native load
+  // proceed in parallel — which is the entire fix.
+  setTimeout(() => {
+    preloadSdk();
+    // Enrichment needs the SDK, so this queues behind the same load promise.
+    warmRepoCache();
+  }, 0);
+
+  onListening();
 });
 
 function shutdown() {
@@ -1187,4 +1234,4 @@ function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-export { server, stream };
+export { server, whenListening };

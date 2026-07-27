@@ -103,10 +103,21 @@ function loadFromDisk() {
   try {
     const parsed = JSON.parse(readFileSync(CACHE_PATH, "utf8"));
     if (!Array.isArray(parsed)) throw new Error("expected a JSON array");
+    // Age every restored entry to exactly softMs + 1: past the soft window of
+    // both TTLs (so it always revalidates) yet inside the hard window of both
+    // (so it is served instantly meanwhile).
+    //
+    // The persisted `fetchedAt` is deliberately DISCARDED rather than clamped
+    // with Math.min. Min only bounds staleness from above, so an entry written
+    // before a reboot kept its original timestamp, aged past hardMs, and became
+    // a hard miss — which killed this optimization in precisely the case it
+    // exists for. Restoring a real timestamp is not what makes this safe:
+    // correctness comes from the revalidate that every restored entry triggers,
+    // plus `onUpdate` pushing a client refresh when the value turns out to differ.
     const staleAt = Date.now() - TTL.list.softMs - 1;
     for (const e of parsed) {
       if (!e || typeof e.key !== "string" || typeof e.fetchedAt !== "number") continue;
-      entries.set(e.key, { value: e.value, fetchedAt: Math.min(e.fetchedAt, staleAt), inflight: null });
+      entries.set(e.key, { value: e.value, fetchedAt: staleAt, inflight: null });
     }
     log.debug("cache rehydrated", { path: CACHE_PATH, entries: entries.size });
   } catch (err) {
