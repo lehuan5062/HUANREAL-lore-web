@@ -5,10 +5,10 @@
 
 import { createServer } from "node:http";
 import { readFile, stat, readdir } from "node:fs/promises";
-import { existsSync, readFileSync, rmSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, renameSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join, extname, normalize as normalizePath, dirname, parse as parsePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 import { log } from "./log.mjs";
 // Lazy wrappers, NOT ./sdk.mjs directly: importing that would load the 29 MB
@@ -28,6 +28,7 @@ import { isLoggedIn, runCli } from "./cli.mjs";
 import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore, hasP4ignore } from "./loreignore.mjs";
 import { discoverServers } from "./discovery.mjs";
 import * as cache from "./cache.mjs";
+import { parseAddress } from "./address.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(HERE, "..", "web");
@@ -814,6 +815,162 @@ async function resetFiles(rp, paths) {
   }
 }
 
+/** Read every GET_DATA chunk for a storageGet item into one buffer, keyed by offset. */
+function reassembleGetData(events, id) {
+  const chunks = events
+    .filter((e) => e.tag === "STORAGE_GET_DATA" && e.data.id === id)
+    .sort((a, b) => a.data.offset - b.data.offset);
+  return Buffer.concat(chunks.map((e) => Buffer.from(e.data.bytes)));
+}
+
+/**
+ * Run a Lore verb to completion via the streaming path and return every event
+ * regardless of outcome. Unlike `collect()`, this never throws and never
+ * discards events on a non-zero overall status — needed here because a
+ * bulk storage verb's per-item ITEM_COMPLETE detail (the actual error code)
+ * is exactly what `collect()`'s throw-on-failure contract discards.
+ * @param {string} verb
+ * @param {Record<string, unknown>} globalArgs
+ * @param {Record<string, unknown>} args
+ * @returns {Promise<import("./errors.mjs").LoreEvt[]>}
+ */
+async function collectAllEvents(verb, globalArgs, args) {
+  const events = [];
+  for await (const ev of stream(verb, globalArgs, args)) events.push(ev);
+  return events;
+}
+
+/**
+ * Force a genuine re-upload of one address that the local store already
+ * (wrongly) marks durable: `storageUpload`/`storagePut` both trust that flag
+ * and skip the remote call entirely, which is exactly the bug that let this
+ * blob go missing from the remote in the first place (see incident context).
+ * Bypasses it the only way the SDK allows: read the bytes out, delete the
+ * local entry so nothing claims it's already handled, then write fresh with
+ * a remote session attached, which forces a real upload attempt.
+ *
+ * Destructive in the middle (obliterate briefly leaves this machine's only
+ * copy at risk if the process dies before the put): the bytes are staged to
+ * a temp file first as a manual-recovery fallback, deleted only after the
+ * put reports success.
+ * @param {Record<string, unknown>} handle
+ * @param {string} partition
+ * @param {{hash: string, context: string}} address
+ */
+async function forceReupload(handle, partition, address) {
+  const getEvents = await collectAllEvents("storageGet", {}, {
+    handle,
+    items: [{ id: 0, partition, address, streaming: false, localCache: true }],
+  });
+  const getComplete = getEvents.find((e) => e.tag === "STORAGE_GET_ITEM_COMPLETE");
+  if (!getComplete || getComplete.data.errorCode !== LoreErrorCode.NONE) {
+    log.error("forceReupload: storageGet failed", { address, events: getEvents.map((e) => e.tag), errorCode: getComplete?.data.errorCode });
+    return { errorCode: getComplete?.data.errorCode ?? LoreErrorCode.INTERNAL };
+  }
+  const bytes = reassembleGetData(getEvents, 0);
+
+  const backupDir = mkdtempSync(join(tmpdir(), "lore-web-push-content-"));
+  const backupPath = join(backupDir, `${address.hash}-${address.context}.bin`);
+  writeFileSync(backupPath, bytes);
+
+  try {
+    await collectAllEvents("storageObliterate", {}, { handle, items: [{ id: 0, partition, address }] });
+
+    const putEvents = await collectAllEvents("storagePut", {}, {
+      handle,
+      items: [{ id: 0, partition, context: address.context, data: bytes, remoteWrite: true, localCache: true, fixedSizeChunk: 0 }],
+    });
+    const putComplete = putEvents.find((e) => e.tag === "STORAGE_PUT_ITEM_COMPLETE");
+    if (!putComplete) {
+      log.error("forceReupload: storagePut produced no completion event; bytes preserved", { address, backupPath, events: putEvents.map((e) => e.tag) });
+      return { errorCode: LoreErrorCode.INTERNAL, backupPath };
+    }
+    if (putComplete.data.errorCode === LoreErrorCode.NONE && putComplete.data.address?.hash !== address.hash) {
+      // Should be unreachable (hash is recomputed from the same bytes we just
+      // read back), but never claim success on a hash mismatch.
+      log.error("forceReupload: put address hash mismatch; bytes preserved", { address, backupPath, gotHash: putComplete.data.address?.hash });
+      return { errorCode: LoreErrorCode.INTERNAL, backupPath };
+    }
+    if (putComplete.data.errorCode === LoreErrorCode.NONE) {
+      rmSync(backupDir, { recursive: true, force: true });
+      return { errorCode: LoreErrorCode.NONE };
+    }
+    log.error("forceReupload: storagePut failed; bytes preserved", { address, backupPath, errorCode: putComplete.data.errorCode });
+    return { errorCode: putComplete.data.errorCode, backupPath };
+  } catch (err) {
+    log.error("forceReupload failed after obliterate; bytes preserved", { address, backupPath, message: err instanceof Error ? err.message : String(err) });
+    return { errorCode: LoreErrorCode.INTERNAL, backupPath };
+  }
+}
+
+/**
+ * Push locally-held content that hasn't been confirmed durable on the remote
+ * back to the remote store. Repairs the case where a commit's upload timed
+ * out: the content stays in the local store (recoverable) but the published
+ * revision references a blob the remote never received, so every other
+ * client fails to sync with ADDRESS_NOT_FOUND.
+ *
+ * Tries the cheap path first (`storageUpload`, wrapping the native
+ * `lore_storage_upload` — this app otherwise never calls it, the CLI has no
+ * equivalent command). If the local store already marks an address durable,
+ * `storageUpload` trusts that and skips the remote call without checking —
+ * which is exactly how the blob went missing to begin with. When that
+ * happens, fall back to `forceReupload`, which bypasses the shortcut.
+ * @param {string} rp repository path
+ * @param {{hash: string, context: string}[]} addresses
+ * @returns {Promise<{hash: string, context: string, alreadyDurable: boolean, errorCode: number, backupPath?: string}[]>}
+ */
+async function pushContent(rp, addresses) {
+  if (addresses.length === 0) return [];
+
+  const statusEvents = await collect("repositoryStatus", { repositoryPath: rp }, { staged: false });
+  const { repository: partition } = xform.repoSummary(statusEvents);
+  if (!partition) throw new LoreVerbError("Could not resolve repository id for push-content", { verb: "pushContent" });
+
+  const remoteUrl = readRepoRemote(rp);
+  if (!remoteUrl) throw new LoreVerbError("Repository has no remote configured", { verb: "storageOpen" });
+
+  const openEvents = await collect("storageOpen", {}, {
+    repositoryPath: rp,
+    hasRemoteConfig: true,
+    remoteConfig: { remoteUrl },
+  });
+  const opened = openEvents.find((e) => e.tag === "STORAGE_OPENED");
+  const handle = opened?.data && { handleId: opened.data.handleId };
+  if (!handle) throw new LoreVerbError("storageOpen did not return a handle", { verb: "storageOpen" });
+
+  try {
+    const items = addresses.map((addr, id) => ({ id, partition, address: addr }));
+    const events = await collect("storageUpload", {}, { handle, items });
+    const byId = new Map();
+    for (const e of events) {
+      if (e.tag === "STORAGE_UPLOAD_ITEM_COMPLETE") byId.set(e.data.id, e.data);
+    }
+
+    const results = [];
+    for (const addr of addresses) {
+      const id = addresses.indexOf(addr);
+      const data = byId.get(id);
+      const alreadyDurable = !!data?.alreadyDurable;
+      let errorCode = data?.errorCode ?? LoreErrorCode.INTERNAL;
+      let backupPath;
+      if (alreadyDurable) {
+        // Locally "durable" but we got here because the remote is missing it
+        // (that's the whole reason this endpoint exists) — verify for real.
+        const forced = await forceReupload(handle, partition, addr);
+        errorCode = forced.errorCode;
+        backupPath = forced.backupPath;
+      }
+      results.push({ hash: addr.hash, context: addr.context, alreadyDurable, errorCode, ...(backupPath ? { backupPath } : {}) });
+    }
+    return results;
+  } finally {
+    await collect("storageClose", {}, { handle }).catch((err) =>
+      log.debug("storageClose failed", { repo: rp, message: err instanceof Error ? err.message : String(err) }),
+    );
+  }
+}
+
 /**
  * Run a content-reading verb (fileDiff, revisionInfo) on the fast local-only path
  * (offline), and if the needed content isn't in the local store
@@ -1140,6 +1297,24 @@ const server = createServer(async (req, res) => {
     if (p === "/api/push" && req.method === "POST") {
       const { path: rp, branch, fastForwardMerge } = await readBody(req);
       return await streamOp(res, "branchPush", { repositoryPath: rp }, { branch, fastForwardMerge: !!fastForwardMerge }, rp);
+    }
+    // Repair: push locally-held, not-yet-durable content to the remote (e.g.
+    // after a commit whose upload timed out). Synchronous, not streamed — it's
+    // a handful of small items, not a bulk sync.
+    if (p === "/api/push-content" && req.method === "POST") {
+      const { path: rp, addresses } = await readBody(req);
+      if (!rp) return sendJson(res, 400, { error: "path required" });
+      if (!Array.isArray(addresses) || addresses.length === 0) {
+        return sendJson(res, 400, { error: "addresses required" });
+      }
+      let parsed;
+      try {
+        parsed = addresses.map(parseAddress);
+      } catch (err) {
+        return sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      const results = await pushContent(rp, parsed);
+      return sendJson(res, 200, { results });
     }
     if (p === "/api/clone" && req.method === "POST") {
       const { url, dest } = await readBody(req);

@@ -1070,11 +1070,23 @@ function renderOpProgress(barFillEl, textEl, data) {
     : "Discovering…";
 }
 
+/** Matches the native SDK's free-text "Address not found: <hash>-<context>" error. */
+const ADDRESS_NOT_FOUND_RE = /Address not found:\s*([0-9a-fA-F]+)-([0-9a-fA-F]+)/gi;
+
+/** Extract every "hash-context" address out of an "Address not found" failure message. */
+function findMissingAddresses(message) {
+  const text = String(message ?? "");
+  const seen = new Set();
+  for (const m of text.matchAll(ADDRESS_NOT_FOUND_RE)) seen.add(`${m[1]}-${m[2]}`);
+  return [...seen];
+}
+
 async function runOp(title, path, payload) {
   const overlay = $("#op-overlay");
   const logEl = $("#op-log");
   const statusEl = $("#op-status");
   const closeBtn = $("#op-close");
+  const pushContentBtn = $("#op-push-content");
   const progressEl = $("#op-progress");
   const barFillEl = $("#op-bar-fill");
   const progressTextEl = $("#op-progress-text");
@@ -1083,17 +1095,21 @@ async function runOp(title, path, payload) {
   statusEl.textContent = "";
   statusEl.className = "";
   closeBtn.hidden = true;
+  pushContentBtn.hidden = true;
+  pushContentBtn.onclick = null;
   progressEl.hidden = true;
   barFillEl.style.width = "0%";
   progressTextEl.textContent = "";
   overlay.hidden = false;
 
+  let failureMessage = "";
   try {
     await apiStream(path, payload, (ev) => {
       if (ev.tag === "LOG") logEl.textContent += (ev.data?.message || "") + "\n";
       else if (ev.tag === "DONE") {
         if (ev.data.ok) barFillEl.style.width = "100%";
-        statusEl.textContent = ev.data.ok ? "Success" : `Failed: ${ev.data.message || "unknown error"}`;
+        failureMessage = ev.data.ok ? "" : ev.data.message || "unknown error";
+        statusEl.textContent = ev.data.ok ? "Success" : `Failed: ${failureMessage}`;
         statusEl.className = ev.data.ok ? "ok" : "fail";
       } else if (PROGRESS_BEGIN_TAGS.has(ev.tag)) {
         progressEl.hidden = false;
@@ -1112,9 +1128,39 @@ async function runOp(title, path, payload) {
       logEl.scrollTop = logEl.scrollHeight;
     });
   } catch (err) {
-    statusEl.textContent = `Failed: ${err.message}`;
+    failureMessage = err.message;
+    statusEl.textContent = `Failed: ${failureMessage}`;
     statusEl.className = "fail";
   }
+
+  // A commit whose content upload timed out publishes a revision other clients
+  // can't sync — the remote never received that blob. The content is usually
+  // still recoverable from whichever machine committed it, so offer to push it
+  // straight from here rather than leaving the user with just an address in an
+  // error string.
+  const missing = failureMessage ? findMissingAddresses(failureMessage) : [];
+  if (missing.length > 0) {
+    pushContentBtn.hidden = false;
+    pushContentBtn.textContent = `Push missing content (${missing.length})`;
+    pushContentBtn.onclick = async () => {
+      pushContentBtn.disabled = true;
+      try {
+        const { results } = await apiPost("/api/push-content", { path: state.active, addresses: missing });
+        const failed = results.filter((r) => r.errorCode !== 0);
+        if (failed.length === 0) {
+          toast("Pushed missing content — retry the sync now.");
+          pushContentBtn.hidden = true;
+        } else {
+          toast(`This machine doesn't have all of the missing content (${failed.length} still missing).`, true);
+        }
+      } catch (err) {
+        toast(err.message, true);
+      } finally {
+        pushContentBtn.disabled = false;
+      }
+    };
+  }
+
   // Keep the overlay blocking until every view reflects the new repo state —
   // interacting with stale branch/status data right after a switch or merge is
   // how merges end up aimed at the wrong branch.
