@@ -322,7 +322,7 @@ async function setOrg(req, res) {
   const base = remote ? remoteBase(remote) : defaultRemoteBase().replace(/\/+$/, "");
   const repositoryUrl = `${base}/${organization}/${repoName}`;
   log.info("changing organization", { path, from: current.organization, to: organization });
-  const id = await recreateLore(path, repositoryUrl);
+  const id = await recreateLore(path, repositoryUrl, { requireExistingId: true });
   notifyChanged("*", "setOrg");
   return sendJson(res, 200, { ...xform.splitOrg(`${organization}/${repoName}`), id });
 }
@@ -347,7 +347,27 @@ async function addRepo(req, res) {
     // A bare host is rejected as invalid, so the name is part of the suggestion.
     const repositoryUrl = (typeof url === "string" && url.trim()) || suggestInitUrl(label);
     log.info("initializing repository", { path, repositoryUrl });
-    await collect("repositoryCreate", { repositoryPath: path }, { repositoryUrl, id: "" });
+    try {
+      await collect("repositoryCreate", { repositoryPath: path }, { repositoryUrl, id: "" });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // The remote already holds a repo under this name with a different id
+      // (e.g. .lore was deleted and re-created, minting a fresh id). Surface a
+      // structured conflict so the UI can offer to adopt the remote's id.
+      const m = message.match(/already exist(?:s)? with id\s*([0-9a-fA-F-]+)\b[\s\S]*does not match/i);
+      if (!m) throw err;
+      // A failed create can leave a partial .lore behind; clear it so a later
+      // adopt (offline create with the remote id) starts from a clean slate.
+      if (isRepo(path)) rmSync(join(path, ".lore"), { recursive: true, force: true });
+      return sendJson(res, 409, {
+        error: message,
+        code: "id_mismatch",
+        remoteId: m[1].replace(/-/g, "").toLowerCase(),
+        path,
+        repositoryUrl,
+        name: label,
+      });
+    }
     // Seed .loreignore (from .gitignore when present) and keep each tool's
     // metadata out of the other's history.
     setupLoreignore(path);
@@ -380,7 +400,7 @@ async function repairRepo(path, res) {
   const remote = readRepoRemote(path);
   const label = path.split(/[\\/]/).filter(Boolean).pop() || path;
   const repositoryUrl = `${remote ? remoteBase(remote) : defaultRemoteBase().replace(/\/+$/, "")}/${label}`;
-  const id = await recreateLore(path, repositoryUrl);
+  const id = await recreateLore(path, repositoryUrl, { requireExistingId: true });
   notifyChanged(path, "repair");
   sendJson(res, 200, { ok: true, id });
 }
@@ -396,15 +416,25 @@ async function repairRepo(path, res) {
  * must guard against or warn about that before invoking it.
  * @param {string} path a Lore working copy
  * @param {string} repositoryUrl the URL whose path component becomes the repo name
- * @returns {Promise<string>} the preserved repository id (hex), or "" if none existed
+ * @param {{id?: string, requireExistingId?: boolean}} [opts] `id` forces a specific
+ *   repository id (hex); `requireExistingId` makes an unreadable `.lore/id` an error
+ *   instead of silently minting a fresh identity (which, offline, is guaranteed to
+ *   mismatch the remote later).
+ * @returns {Promise<string>} the repository id (hex) the rebuild used, or "" if none
  */
-async function recreateLore(path, repositoryUrl) {
+async function recreateLore(path, repositoryUrl, { id: forcedId, requireExistingId = false } = {}) {
   const dot = join(path, ".lore");
-  let id = "";
-  try {
-    id = readFileSync(join(dot, "id")).toString("hex");
-  } catch {
-    // no id file — let create mint a fresh one
+  let id = forcedId || "";
+  if (!id) {
+    try {
+      id = readFileSync(join(dot, "id")).toString("hex");
+    } catch {
+      if (requireExistingId) {
+        throw new Error(
+          "cannot read this repository's id (.lore/id); rebuilding without it would mint a new identity that conflicts with the remote",
+        );
+      }
+    }
   }
   log.info("recreating repository .lore", { path, repositoryUrl, id });
   const backup = `${dot}.repair-bak`;
@@ -430,6 +460,47 @@ async function recreateLore(path, repositoryUrl) {
     }
   }
   return id;
+}
+
+/**
+ * POST /api/adopt-remote-id — bind a local folder to a repository that already
+ * exists on the remote under the same name but a different id (the "already
+ * exist with id X which does not match Y" conflict from repositoryCreate).
+ * Recreates the local `.lore` offline with the remote's id, so future syncs talk
+ * to the existing server-side repository. Refused when the folder has committed
+ * local history — adopting the remote's identity under divergent history risks
+ * corruption; such a folder should be re-cloned instead.
+ */
+async function adoptRemoteId(req, res) {
+  const body = await readBody(req);
+  const path = typeof body.path === "string" ? toUnixPath(body.path) : "";
+  const remoteId = typeof body.remoteId === "string" ? body.remoteId.replace(/-/g, "").toLowerCase() : "";
+  const repositoryUrl = typeof body.url === "string" ? body.url.trim() : "";
+  if (!path) return sendJson(res, 400, { error: "path required" });
+  if (!existsSync(path)) return sendJson(res, 400, { error: "path does not exist" });
+  if (!/^[0-9a-f]+$/.test(remoteId)) return sendJson(res, 400, { error: "remoteId must be a hex repository id" });
+  if (!repositoryUrl) return sendJson(res, 400, { error: "url required" });
+  const label = path.split(/[\\/]/).filter(Boolean).pop() || path;
+  log.info("adopting remote repository id", { path, repositoryUrl, remoteId });
+  if (isRepo(path)) {
+    // Guard: never destroy committed history (same rule as repair).
+    const hist = xform.history(await collect("revisionHistory", { repositoryPath: path }, { length: 1 }));
+    if (hist.length > 0) {
+      return sendJson(res, 409, {
+        error: "repository has committed revisions; adopting the remote id would lose them — re-clone from the remote instead",
+      });
+    }
+    await recreateLore(path, repositoryUrl, { id: remoteId });
+  } else {
+    // The add-flow collision case: no .lore yet, so create it offline directly
+    // under the remote's id. Existing working files simply become local changes.
+    await collect("repositoryCreate", { repositoryPath: path, offline: true }, { repositoryUrl, id: remoteId });
+    setupLoreignore(path);
+  }
+  const entry = store.addRepo(path, label);
+  watchRepo(path, () => notifyChanged(path, "fs"));
+  notifyChanged("*", "adoptRemoteId");
+  sendJson(res, 200, { repo: entry, id: remoteId });
 }
 
 /**
@@ -1282,6 +1353,11 @@ const server = createServer(async (req, res) => {
       const { path: rp } = await readBody(req);
       if (!rp) return sendJson(res, 400, { error: "path required" });
       return await repairRepo(toUnixPath(rp), res);
+    }
+    // Bind a local folder to a repo the remote already hosts under the same
+    // name (resolves the repositoryCreate id-mismatch conflict).
+    if (p === "/api/adopt-remote-id" && req.method === "POST") {
+      return await adoptRemoteId(req, res);
     }
     if (p === "/api/commit" && req.method === "POST") {
       const { path: rp, message } = await readBody(req);

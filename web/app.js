@@ -25,10 +25,19 @@ const state = {
   refreshSeq: 0,
 };
 
+/** Build an Error carrying the response status and JSON body, so callers can
+ * react to structured failures (e.g. the id_mismatch conflict) beyond the message. */
+function apiError(res, body) {
+  const err = new Error(body.error || res.statusText);
+  err.status = res.status;
+  err.body = body;
+  return err;
+}
+
 async function apiGet(path) {
   const res = await fetch(path);
   const body = await res.json();
-  if (!res.ok) throw new Error(body.error || res.statusText);
+  if (!res.ok) throw apiError(res, body);
   return body;
 }
 
@@ -39,7 +48,7 @@ async function apiPost(path, payload) {
     body: JSON.stringify(payload),
   });
   const body = await res.json();
-  if (!res.ok) throw new Error(body.error || res.statusText);
+  if (!res.ok) throw apiError(res, body);
   return body;
 }
 
@@ -173,8 +182,40 @@ async function addRepo() {
     selectRepo(path);
     toast(initialized ? "Repository initialized" : "Repository added");
   } catch (err) {
+    if (err.body?.code === "id_mismatch") return handleIdMismatch(err.body);
     toast(err.message, true);
   }
+}
+
+/**
+ * The server already hosts a repository under this name with a different id
+ * (the local .lore was likely deleted or the folder re-created). Offer to adopt
+ * the server's identity, clone instead, or cancel.
+ */
+function handleIdMismatch({ path, repositoryUrl, remoteId, name }) {
+  $("#adopt-text").textContent =
+    `The server already has a repository named "${name}" (${repositoryUrl}). ` +
+    `Adopt it to bind this folder to the existing server repository — your files become local changes. ` +
+    `Or clone the server's copy into a fresh folder instead.`;
+  const dlg = $("#adopt-dialog");
+  $("#adopt-go").onclick = async () => {
+    dlg.close();
+    try {
+      await apiPost("/api/adopt-remote-id", { path, remoteId, url: repositoryUrl });
+      await loadRepos();
+      selectRepo(path);
+      toast("Adopted the server repository's identity");
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  $("#adopt-clone").onclick = () => {
+    dlg.close();
+    $("#clone-url").value = repositoryUrl;
+    $("#clone-dest").value = "";
+    $("#clone-dialog").showModal();
+  };
+  dlg.showModal();
 }
 
 /**

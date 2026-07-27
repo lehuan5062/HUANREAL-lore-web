@@ -184,6 +184,19 @@
       </form>
     </dialog>
 
+    <!-- Repository name/id conflict — the server already hosts this name -->
+    <dialog id="adopt-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Repository already exists on server</h3>
+        <p class="muted" id="adopt-text"></p>
+        <menu>
+          <button value="cancel">Cancel</button>
+          <button type="button" id="adopt-clone">Clone instead…</button>
+          <button type="button" id="adopt-go" class="primary">Adopt server repository</button>
+        </menu>
+      </form>
+    </dialog>
+
     <!-- Organization editor — recreates the repo identity under a new org -->
     <dialog id="org-dialog">
       <form method="dialog" class="clone-form">
