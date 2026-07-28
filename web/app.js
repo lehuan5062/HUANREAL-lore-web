@@ -1503,6 +1503,16 @@ function wirePicker() {
   });
 }
 
+/** Show a loading placeholder in the Server repositories list while a listing
+ * request is in flight — otherwise the dialog looks identical whether it's
+ * genuinely still working (listing now cross-checks every name against the
+ * server, which can take a few seconds against a real remote) or broken. */
+function showServerReposLoading() {
+  const ul = $("#server-repos");
+  ul.innerHTML = `<li class="muted">Loading…</li>`;
+  ul.hidden = false;
+}
+
 /** Fetch the server's hosted repositories into the Server repositories dialog
  * (server URL from the field, or the default when blank). */
 async function loadServerRepos() {
@@ -1659,18 +1669,26 @@ function wire() {
 
   // Server repositories: open the dialog and list immediately (it falls back to
   // the default server when the field is blank, so the catalog shows at once).
+  // Listing cross-checks every repo name against the server (see
+  // listRemoteRepos), so a real remote can take a few seconds — show a loading
+  // placeholder rather than leaving the dialog looking empty/broken meanwhile.
   $("#server-btn").onclick = async () => {
-    $("#server-repos").hidden = true;
+    showServerReposLoading();
     $("#server-dialog").showModal();
+    const btn = $("#server-refresh");
+    btn.disabled = true;
     try {
       await loadServerRepos();
     } catch (err) {
       toast(err.message, true);
+    } finally {
+      btn.disabled = false;
     }
   };
   $("#server-refresh").onclick = async () => {
     const btn = $("#server-refresh");
     btn.disabled = true;
+    showServerReposLoading();
     try {
       await loadServerRepos();
     } catch (err) {
