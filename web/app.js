@@ -394,8 +394,8 @@ async function loadStatus(pathEnc) {
     const byPath = (a, b) => a.path.localeCompare(b.path, undefined, { sensitivity: "base" });
     const staged = data.files.filter((f) => f.flagStaged).sort(byPath);
     const unstaged = data.files.filter((f) => !f.flagStaged).sort(byPath);
-    renderFiles($("#staged-files"), staged, "unstage");
-    renderFiles($("#unstaged-files"), unstaged, "stage");
+    renderVirtualFiles($("#staged-files"), staged, "unstage");
+    renderVirtualFiles($("#unstaged-files"), unstaged, "stage");
     $("#commit-btn").disabled = staged.length === 0;
     $("#stage-all-btn").disabled = unstaged.length === 0;
     $("#unstage-all-btn").disabled = staged.length === 0;
@@ -536,27 +536,98 @@ async function abortMerge() {
   }
 }
 
-function renderFiles(ul, files, action) {
-  ul.innerHTML = "";
+const FILES_ROW_HEIGHT = 45; // must match .files li's fixed height in style.css
+const FILES_OVERSCAN = 8; // extra rows rendered above/below the viewport
+
+/** Per-container virtualization state: the files/action currently rendered,
+ * so the delegated click handler and the scroll-driven re-render always read
+ * current data. @type {WeakMap<Element, {files: object[], action: string}>} */
+const virtualFilesState = new WeakMap();
+
+/**
+ * Render a file list without building one DOM node per file: only the rows
+ * within the visible scroll viewport (plus a small overscan buffer) are ever
+ * in the DOM, rebuilt as the user scrolls. A repo with tens of thousands of
+ * changed files previously froze the tab for several seconds building and
+ * laying out every row at once; this keeps that cost constant regardless of
+ * list size. `container` is the `.files` element (e.g. #staged-files);
+ * `action` is "stage" or "unstage".
+ */
+function renderVirtualFiles(container, files, action) {
   if (files.length === 0) {
-    ul.innerHTML = `<li class="muted">— none —</li>`;
+    container.classList.remove("virtual");
+    container.innerHTML = `<li class="muted">— none —</li>`;
+    virtualFilesState.delete(container);
     return;
   }
-  for (const f of files) {
+  container.classList.add("virtual");
+
+  let sizer = container.querySelector(":scope > .files-sizer");
+  let windowEl = container.querySelector(":scope > .files-window");
+  if (!sizer || !windowEl) {
+    container.innerHTML = "";
+    sizer = document.createElement("div");
+    sizer.className = "files-sizer";
+    windowEl = document.createElement("ul");
+    windowEl.className = "files-window";
+    container.appendChild(sizer);
+    container.appendChild(windowEl);
+  }
+  // Attach listeners exactly once per container's lifetime (it's a static
+  // element reused across every loadStatus refresh) — separate from the DOM
+  // structure above, which does get torn down and rebuilt whenever the list
+  // toggles between empty and non-empty.
+  if (!container.dataset.virtualized) {
+    container.dataset.virtualized = "1";
+    container.addEventListener("scroll", () => renderVisibleFileRows(container));
+    container.addEventListener("click", (e) => {
+      const li = e.target.closest("li[data-index]");
+      if (!li) return;
+      const st = virtualFilesState.get(container);
+      const f = st?.files[Number(li.dataset.index)];
+      if (!f) return;
+      if (e.target.closest(".f-path")) showDiff(f.path);
+      else if (e.target.closest(".f-do")) fileAction(st.action, f.path);
+      else if (e.target.closest(".f-ignore")) openIgnoreMenu(f);
+      else if (e.target.closest(".f-reset")) fileAction("reset", f.path);
+    });
+  }
+
+  virtualFilesState.set(container, { files, action });
+  sizer.style.height = `${files.length * FILES_ROW_HEIGHT}px`;
+  container.scrollTop = 0;
+  renderVisibleFileRows(container);
+}
+
+/** Rebuild just the currently-visible rows of a virtualized file list, per
+ * the container's current scroll position — see renderVirtualFiles. */
+function renderVisibleFileRows(container) {
+  const st = virtualFilesState.get(container);
+  if (!st) return;
+  const { files, action } = st;
+  const windowEl = container.querySelector(":scope > .files-window");
+  if (!windowEl) return;
+  const start = Math.max(0, Math.floor(container.scrollTop / FILES_ROW_HEIGHT) - FILES_OVERSCAN);
+  const visibleCount = Math.ceil(container.clientHeight / FILES_ROW_HEIGHT) + FILES_OVERSCAN * 2;
+  const end = Math.min(files.length, start + visibleCount);
+
+  const frag = document.createDocumentFragment();
+  for (let i = start; i < end; i++) {
+    const f = files[i];
     const [label, cls] = fileBadge(f);
     const li = document.createElement("li");
+    li.dataset.index = i;
     li.innerHTML = `
       <span class="f-act ${cls}">${label}</span>
       <span class="f-path" title="${f.path}">${f.path}</span>
       <button class="f-do">${action === "stage" ? "Stage" : "Unstage"}</button>
       <button class="f-ignore" title="Add to .loreignore">⊘</button>
       ${action === "stage" ? `<button class="f-reset" title="Discard changes">↺</button>` : ""}`;
-    li.querySelector(".f-path").onclick = () => showDiff(f.path);
-    li.querySelector(".f-do").onclick = () => fileAction(action, f.path);
-    li.querySelector(".f-ignore").onclick = () => openIgnoreMenu(f);
-    li.querySelector(".f-reset")?.addEventListener("click", () => fileAction("reset", f.path));
-    ul.appendChild(li);
+    frag.appendChild(li);
   }
+  windowEl.innerHTML = "";
+  windowEl.appendChild(frag);
+  windowEl.style.transform = `translateY(${start * FILES_ROW_HEIGHT}px)`;
 }
 
 /**

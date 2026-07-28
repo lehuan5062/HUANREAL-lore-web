@@ -137,8 +137,23 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .file-col h3 .link-btn { font-size: 11px; text-transform: none; letter-spacing: normal; color: var(--accent); border: none; background: none; padding: 0; cursor: pointer; }
 .file-col h3 .link-btn:hover { text-decoration: underline; }
 .file-col h3 .link-btn:disabled { color: var(--muted); cursor: default; text-decoration: none; }
+/* Virtualized: .files is the scroll viewport (fixed height), .files-sizer gives
+   the scrollbar correct proportions for the full (possibly huge) list, and
+   .files-window holds only the currently-visible rows, translated to the right
+   scroll offset. See renderVirtualFiles in app.js — this avoids building one
+   DOM node per file regardless of how large the list is (a repo with tens of
+   thousands of changed files previously froze the tab building/laying out all
+   of them at once). */
 .files { list-style: none; margin: 0; padding: 0; }
-.files li { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; }
+/* .virtual is added only while non-empty (renderVirtualFiles): height (not
+   max-height), since both children below are position:absolute and out of
+   flow, so the list has no natural height of its own to be capped against --
+   it needs an explicit height to have any viewport at all. Left off the base
+   .files rule so an empty/small list doesn't show a tall empty box. */
+.files.virtual { height: 50vh; overflow-y: auto; position: relative; }
+.files-sizer { position: absolute; top: 0; left: 0; width: 1px; pointer-events: none; visibility: hidden; }
+.files-window { position: absolute; top: 0; left: 0; right: 0; list-style: none; margin: 0; padding: 0; }
+.files li { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; height: 45px; box-sizing: border-box; }
 .files li:hover { background: var(--panel-2); }
 .files .f-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .files .f-act { font-size: 11px; color: var(--muted); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); }
