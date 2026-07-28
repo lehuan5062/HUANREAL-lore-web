@@ -1180,6 +1180,28 @@ function renderOpProgress(barFillEl, textEl, data) {
     : "Discovering…";
 }
 
+// A single native LOG event can embed thousands of file paths as one message
+// (e.g. staging a large repo logs its full invocation args as one line) —
+// the server already truncates these (server/sdk.mjs), but cap again here as
+// a second line of defense, and bound the log element's total size so a very
+// long-running stream of ordinary-sized lines can't grow the DOM node
+// unbounded either. Both matter: an unbounded single append can freeze the
+// tab outright; an unbounded total size degrades everything after it.
+const OP_LOG_MESSAGE_LIMIT = 2000;
+const OP_LOG_TOTAL_LIMIT = 50_000;
+
+/** Append text to the op log overlay, capping per-message and total size. */
+function appendOpLog(logEl, text) {
+  if (text.length > OP_LOG_MESSAGE_LIMIT) {
+    text = `${text.slice(0, OP_LOG_MESSAGE_LIMIT)}… [truncated, ${text.length} chars total]\n`;
+  }
+  let next = logEl.textContent + text;
+  if (next.length > OP_LOG_TOTAL_LIMIT) {
+    next = `… [earlier output trimmed]\n${next.slice(-OP_LOG_TOTAL_LIMIT)}`;
+  }
+  logEl.textContent = next;
+}
+
 /** Matches the native SDK's free-text "Address not found: <hash>-<context>" error. */
 const ADDRESS_NOT_FOUND_RE = /Address not found:\s*([0-9a-fA-F]+)-([0-9a-fA-F]+)/gi;
 
@@ -1221,11 +1243,24 @@ async function runOp(title, path, payload, opts = {}) {
   progressTextEl.textContent = "";
   overlay.hidden = false;
 
+  // Coalesce the log-scroll reflow to once per animation frame instead of
+  // once per event — a high-volume stream (thousands of file-op events) would
+  // otherwise force a synchronous layout on every single one.
+  let scrollScheduled = false;
+  function scheduleLogScroll() {
+    if (scrollScheduled) return;
+    scrollScheduled = true;
+    requestAnimationFrame(() => {
+      logEl.scrollTop = logEl.scrollHeight;
+      scrollScheduled = false;
+    });
+  }
+
   let failureMessage = "";
   let fileOpTotal = 0;
   try {
     await apiStream(path, payload, (ev) => {
-      if (ev.tag === "LOG") logEl.textContent += (ev.data?.message || "") + "\n";
+      if (ev.tag === "LOG") appendOpLog(logEl, (ev.data?.message || "") + "\n");
       else if (ev.tag === "DONE") {
         if (ev.data.ok) barFillEl.style.width = "100%";
         failureMessage = ev.data.ok ? "" : ev.data.message || "unknown error";
@@ -1257,9 +1292,9 @@ async function runOp(title, path, payload, opts = {}) {
         // dropped — see FILE_OP_NOISE_TAGS
       } else if (ev.tag !== "END" && ev.tag !== "COMPLETE") {
         // Surface other progress-bearing events compactly.
-        logEl.textContent += `• ${ev.tag}\n`;
+        appendOpLog(logEl, `• ${ev.tag}\n`);
       }
-      logEl.scrollTop = logEl.scrollHeight;
+      scheduleLogScroll();
     });
   } catch (err) {
     failureMessage = err.message;

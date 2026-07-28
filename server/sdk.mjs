@@ -220,6 +220,16 @@ export async function collect(verb, globalArgs, args = {}) {
  * @param {Record<string, unknown>} [args]
  * @returns {AsyncGenerator<LoreEvt>}
  */
+// A native LOG event can embed an entire verb invocation's arguments as one
+// message — e.g. staging ~10,000 files logs "Command arguments:
+// LoreFileStageArgs { paths: [...every absolute path...], ... }" as a single
+// multi-megabyte string. Piped to the browser unmodified, one such line is
+// enough to freeze the tab (synchronous JSON.parse + DOM append of a
+// multi-MB string with no yield point). LOG content is diagnostic-only —
+// nothing reads it downstream — so it's safe to cap before it leaves this
+// process; the full message still reaches the server's own debug log below.
+const CLIENT_LOG_MESSAGE_LIMIT = 2000;
+
 export async function* stream(verb, globalArgs, args = {}) {
   const fn = resolve(verb);
   let status = 0;
@@ -228,15 +238,25 @@ export async function* stream(verb, globalArgs, args = {}) {
   const exec = fn(globalArgs, args);
   try {
     for await (const ev of exec.asyncIter()) {
-      const n = normalize(ev);
+      let n = normalize(ev);
       if (n.tag === "COMPLETE") {
         status = n.data?.status ?? 0;
         failure = failure ?? n.data?.error?.message;
       }
       if (n.tag === "ERROR") failure = failure ?? n.data?.errorInner;
       if (n.tag === "LOG") {
+        const message = String(n.data?.message ?? "");
         const lvl = LOG_LEVEL[n.data?.level] ?? "debug";
-        log[/** @type {"debug"} */ (lvl)](`lore: ${n.data?.message ?? ""}`, { verb });
+        log[/** @type {"debug"} */ (lvl)](`lore: ${message}`, { verb }); // full message, server-side only
+        if (message.length > CLIENT_LOG_MESSAGE_LIMIT) {
+          n = {
+            ...n,
+            data: {
+              ...n.data,
+              message: `${message.slice(0, CLIENT_LOG_MESSAGE_LIMIT)}… [truncated, ${message.length} chars total]`,
+            },
+          };
+        }
       }
       yield n;
     }
