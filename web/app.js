@@ -27,6 +27,14 @@ const state = {
   // deleting a row acts on the server shown, not whatever the input field
   // currently contains (which is blank before the first listing loads).
   serverReposBase: "",
+  // Bumped on every loadServerRepos() call; the background name-conflict
+  // verify started by that call captures it and checks it's still current
+  // before touching the DOM, so a slow verify from a superseded load/refresh
+  // can never overwrite a newer render.
+  serverReposGen: 0,
+  // The fast-list repos currently rendered, so the background verify can
+  // merge resolvedId/nameMismatch onto them by name without re-fetching.
+  serverReposList: [],
 };
 
 /** Build an Error carrying the response status and JSON body, so callers can
@@ -1503,10 +1511,9 @@ function wirePicker() {
   });
 }
 
-/** Show a loading placeholder in the Server repositories list while a listing
- * request is in flight — otherwise the dialog looks identical whether it's
- * genuinely still working (listing now cross-checks every name against the
- * server, which can take a few seconds against a real remote) or broken. */
+/** Show a loading placeholder in the Server repositories list while the fast
+ * listing request is in flight, so the dialog doesn't look identical whether
+ * it's still working or broken. */
 function showServerReposLoading() {
   const ul = $("#server-repos");
   ul.innerHTML = `<li class="muted">Loading…</li>`;
@@ -1514,13 +1521,80 @@ function showServerReposLoading() {
 }
 
 /** Fetch the server's hosted repositories into the Server repositories dialog
- * (server URL from the field, or the default when blank). */
+ * (server URL from the field, or the default when blank). Renders the fast
+ * list immediately, then kicks off the name-conflict cross-check in the
+ * background (see verifyServerRepos) — the list itself never waits on it. */
 async function loadServerRepos() {
   const server = $("#server-url").value.trim();
+  const gen = ++state.serverReposGen;
   const data = await apiGet(`/api/remote-repos${server ? `?url=${encodeURIComponent(server)}` : ""}`);
+  if (gen !== state.serverReposGen) return; // a newer load/refresh already superseded this one
   $("#server-url").value = data.base;
   state.serverReposBase = data.base;
+  state.serverReposList = data.repos;
   renderServerRepos(data.repos);
+  verifyServerRepos(gen, data.base, data.repos.map((r) => r.name));
+}
+
+/**
+ * Cross-check every rendered name (plus every tracked local repo's name)
+ * against the server in the background, via POST /api/remote-repos/verify,
+ * and patch in `nameMismatch`/`listed: false` badges once it resolves. Split
+ * out from the fast list fetch because this cross-check runs one
+ * repositoryInfo probe per name (bounded to 3 concurrent server-side) and a
+ * single stalled name can cost the full verb idle timeout — the list itself
+ * must never wait on that. Best-effort: a slow or failed verify never surfaces
+ * an error toast, since the listing is already fully usable without it.
+ * @param {number} gen this call's generation, from loadServerRepos
+ * @param {string} base
+ * @param {string[]} names
+ */
+async function verifyServerRepos(gen, base, names) {
+  showServerReposChecking(true);
+  try {
+    const { listed, phantom } = await apiPost("/api/remote-repos/verify", { base, names });
+    if (gen !== state.serverReposGen) return; // superseded by a newer load/refresh
+    const repos = state.serverReposList.map((r) => {
+      const resolvedId = listed[r.name];
+      return { ...r, resolvedId, nameMismatch: resolvedId != null && resolvedId !== r.id };
+    });
+    for (const p of phantom) {
+      repos.push({
+        id: p.resolvedId,
+        name: p.name,
+        url: `${base}/${p.name}`,
+        idUrl: `${base}/${p.resolvedId}`,
+        tracked: p.tracked,
+        resolvedId: p.resolvedId,
+        nameMismatch: false,
+        listed: false,
+      });
+    }
+    state.serverReposList = repos;
+    renderServerRepos(repos);
+  } catch {
+    // Best-effort enhancement — a failed/slow verify doesn't invalidate the
+    // already-rendered, already-usable listing.
+  } finally {
+    if (gen === state.serverReposGen) showServerReposChecking(false);
+  }
+}
+
+/** Toggle a small non-blocking indicator under the rendered rows while the
+ * background name-conflict verify (see verifyServerRepos) is in flight. */
+function showServerReposChecking(show) {
+  const ul = $("#server-repos");
+  let li = ul.querySelector(".server-repos-checking");
+  if (show) {
+    if (!li) {
+      li = document.createElement("li");
+      li.className = "muted server-repos-checking";
+      li.textContent = "Checking for name conflicts…";
+      ul.appendChild(li);
+    }
+  } else {
+    li?.remove();
+  }
 }
 
 /**
@@ -1529,8 +1603,9 @@ async function loadServerRepos() {
  * (removes it from the server by id — see the server's deleteRemoteRepo).
  * Repos already cloned on this machine are tagged, and rows the server's name
  * resolution disagrees with the listing on (`listed: false` / `nameMismatch`,
- * from `listRemoteRepos`'s repositoryInfo cross-check) are flagged — these are
- * exactly the phantom name bindings that make a fresh add collide.
+ * from the background `verifyServerRepos` cross-check) are flagged once it
+ * completes — these are exactly the phantom name bindings that make a fresh
+ * add collide.
  */
 function renderServerRepos(repos) {
   const ul = $("#server-repos");
@@ -1550,7 +1625,7 @@ function renderServerRepos(repos) {
     li.innerHTML =
       `<span class="p-name" title="${title}">${r.name}</span>${tags.join("")}` +
       `<button type="button" class="p-clone">Clone</button>` +
-      `<button type="button" class="p-del danger">Delete</button>`;
+      `<button type="button" class="p-del">Delete</button>`;
     li.querySelector(".p-clone").onclick = () => cloneServerRepo(r);
     li.querySelector(".p-del").onclick = () => deleteServerRepo(r);
     ul.appendChild(li);
@@ -1669,11 +1744,18 @@ function wire() {
 
   // Server repositories: open the dialog and list immediately (it falls back to
   // the default server when the field is blank, so the catalog shows at once).
-  // Listing cross-checks every repo name against the server (see
-  // listRemoteRepos), so a real remote can take a few seconds — show a loading
-  // placeholder rather than leaving the dialog looking empty/broken meanwhile.
+  // If the last-loaded list is still around for the same server, show it
+  // instantly instead of blanking to "Loading…" on every reopen — loadServerRepos
+  // silently refreshes it underneath either way, same as a stale-while-
+  // revalidate cache.
   $("#server-btn").onclick = async () => {
-    showServerReposLoading();
+    const urlField = $("#server-url").value.trim();
+    const sameServer = !urlField || urlField === state.serverReposBase;
+    if (sameServer && state.serverReposList.length > 0) {
+      renderServerRepos(state.serverReposList);
+    } else {
+      showServerReposLoading();
+    }
     $("#server-dialog").showModal();
     const btn = $("#server-refresh");
     btn.disabled = true;

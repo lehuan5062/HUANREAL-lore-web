@@ -562,13 +562,16 @@ async function mapLimited(items, limit, fn) {
  * (the remote of an already-tracked repo, an env override, or the local server).
  * Each entry is returned with a ready-to-clone URL of the form <base>/<name>.
  *
- * `repositoryList` alone is not ground truth: a name can be bound to a
- * repository id the listing doesn't enumerate, which is exactly what makes
- * `repositoryCreate` collide on a name that looks free. Every listed name is
- * cross-checked with `resolveRemoteName`, and so are the names of every
- * tracked local repo — surfacing `nameMismatch` (the name resolves to a
- * different id than listed) and `listed: false` (a name that resolves but
- * appears in no listing entry) entries.
+ * Deliberately just `repositoryList` — fast, no cross-checking. An earlier
+ * version of this endpoint cross-checked every name against `repositoryInfo`
+ * inline (see `verifyRemoteRepoNames` below for why that check is valuable),
+ * but doing that here meant the whole response waited on every probe: bounded
+ * to 3 concurrent, each able to take the full verb idle timeout (60s) if a
+ * name stalls, a server listing even a couple dozen repos against a
+ * slow/flaky remote could hold this response for many minutes — "just list
+ * the repos" has no business taking that long. The client now renders this
+ * fast list immediately and requests the cross-check separately, in the
+ * background, patching in badges once it completes.
  * @param {import("node:http").ServerResponse} res
  * @param {string|null} rawUrl the server URL to query; empty/null uses the default
  */
@@ -576,8 +579,34 @@ async function listRemoteRepos(res, rawUrl) {
   const base = remoteBase((rawUrl || "").trim() || defaultRemoteBase());
   const events = await collect("repositoryList", {}, { url: base });
   const local = localRepoIds();
-  const listed = xform.remoteRepos(events);
-  const listedNames = new Set(listed.map((r) => r.name));
+  const repos = xform.remoteRepos(events).map((r) => ({
+    ...r,
+    url: `${base}/${r.name}`,
+    idUrl: `${base}/${r.id}`,
+    tracked: local.has(r.id),
+  }));
+  sendJson(res, 200, { base, repos });
+}
+
+/**
+ * POST /api/remote-repos/verify — the background half of the repository
+ * listing: cross-check every given name (the ones the client already rendered
+ * from `listRemoteRepos`) plus every tracked local repo's name against this
+ * same server, via `repositoryInfo`. `repositoryList` alone is not ground
+ * truth: a name can be bound to a repository id the listing doesn't
+ * enumerate, which is exactly what makes `repositoryCreate` collide on a name
+ * that looks free. Split out from `listRemoteRepos` so the (potentially very
+ * slow, one stalled name can cost up to the full verb idle timeout) cross-
+ * check never blocks the initial listing.
+ * @param {import("node:http").IncomingMessage} req
+ * @param {import("node:http").ServerResponse} res
+ */
+async function verifyRemoteRepoNames(req, res) {
+  const { base: rawBase, names } = await readBody(req);
+  if (!Array.isArray(names)) return sendJson(res, 400, { error: "names must be an array" });
+  const base = remoteBase((rawBase || "").trim() || defaultRemoteBase());
+  const local = localRepoIds();
+  const listedNames = new Set(names);
 
   // Names of tracked local repos pointed at this same server, so their name
   // can be cross-checked even if the listing doesn't cover them.
@@ -598,41 +627,16 @@ async function listRemoteRepos(res, rawUrl) {
   // fan-out here is a real resource-exhaustion risk, not just a style choice.
   const RESOLVE_CONCURRENCY = 3;
   const [listedResolved, phantomResolved] = await Promise.all([
-    mapLimited(listed, RESOLVE_CONCURRENCY, (r) => resolveRemoteName(base, r.name)),
+    mapLimited(names, RESOLVE_CONCURRENCY, (name) => resolveRemoteName(base, name)),
     mapLimited([...candidateNames], RESOLVE_CONCURRENCY, (name) => resolveRemoteName(base, name)),
   ]);
 
-  // Address each repo by its id (server-listed names do not resolve for repos
-  // created without an owner — see deleteRemoteRepo) but offer the name-based
-  // URL for cloning, which the user expects to look like the real remote.
-  const repos = listed.map((r, i) => {
-    const resolvedId = listedResolved[i];
-    return {
-      ...r,
-      url: `${base}/${r.name}`,
-      idUrl: `${base}/${r.id}`,
-      tracked: local.has(r.id),
-      resolvedId,
-      nameMismatch: resolvedId != null && resolvedId !== r.id,
-    };
-  });
+  const listed = Object.fromEntries(names.map((name, i) => [name, listedResolved[i]]));
+  const phantom = [...candidateNames]
+    .map((name, i) => ({ name, resolvedId: phantomResolved[i], tracked: local.has(phantomResolved[i]) }))
+    .filter((p) => p.resolvedId != null); // doesn't actually resolve — nothing phantom here
 
-  [...candidateNames].forEach((name, i) => {
-    const resolvedId = phantomResolved[i];
-    if (resolvedId == null) return; // doesn't actually resolve — nothing phantom here
-    repos.push({
-      id: resolvedId,
-      name,
-      url: `${base}/${name}`,
-      idUrl: `${base}/${resolvedId}`,
-      tracked: local.has(resolvedId),
-      resolvedId,
-      nameMismatch: false,
-      listed: false,
-    });
-  });
-
-  sendJson(res, 200, { base, repos });
+  sendJson(res, 200, { base, listed, phantom });
 }
 
 /** Repository ids of every tracked local working copy (from each .lore/id). */
@@ -1330,6 +1334,7 @@ const server = createServer(async (req, res) => {
 
     if (p === "/api/remote-repos" && req.method === "GET") return await listRemoteRepos(res, q.get("url"));
     if (p === "/api/remote-repos" && req.method === "DELETE") return await deleteRemoteRepo(req, res);
+    if (p === "/api/remote-repos/verify" && req.method === "POST") return await verifyRemoteRepoNames(req, res);
 
     if (p === "/api/repos" && req.method === "GET") return await listRepos(res);
     if (p === "/api/repos" && req.method === "POST") return await addRepo(req, res);
