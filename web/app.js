@@ -198,12 +198,20 @@ async function addRepo() {
     return toast(err.message, true);
   }
   try {
-    const { initialized } = await apiPost("/api/repos", { path, url });
-    await loadRepos();
-    selectRepo(path);
+    const initialized = await runBlocking("Adding repository…", async () => {
+      const res = await apiPost("/api/repos", { path, url });
+      await loadRepos();
+      selectRepo(path);
+      return res.initialized;
+    });
     toast(initialized ? "Repository initialized" : "Repository added");
   } catch (err) {
-    if (err.body?.code === "id_mismatch") return handleIdMismatch(err.body);
+    if (err.body?.code === "id_mismatch") {
+      // Hand off to the collision dialog — drop the failed overlay first so it
+      // isn't left sitting behind the dialog showing a now-irrelevant error.
+      $("#op-overlay").hidden = true;
+      return handleIdMismatch(err.body);
+    }
     toast(err.message, true);
   }
 }
@@ -220,12 +228,17 @@ function handleIdMismatch({ path, repositoryUrl, remoteId, name }) {
     `Or clone the server's copy into a fresh folder instead.`;
   const dlg = $("#adopt-dialog");
   $("#adopt-go").onclick = async () => {
-    dlg.close();
+    dlg.close(); // before the overlay: a showModal() dialog outranks any z-index
     try {
-      await apiPost("/api/adopt-remote-id", { path, remoteId, url: repositoryUrl });
-      await loadRepos();
-      selectRepo(path);
-      toast("Adopted the server repository's identity");
+      await runBlocking(
+        "Adopting server repository…",
+        async () => {
+          await apiPost("/api/adopt-remote-id", { path, remoteId, url: repositoryUrl });
+          await loadRepos();
+          selectRepo(path);
+        },
+        { keepOpen: true, successMessage: "Adopted the server repository's identity" },
+      );
     } catch (err) {
       toast(err.message, true);
     }
@@ -516,9 +529,11 @@ async function abortMerge() {
   // Skip confirmation if nothing is staged — nothing to lose
   if (!hasStagedFiles) {
     try {
-      await apiPost("/api/merge/abort", { path: state.active });
+      await runBlocking("Aborting merge…", async () => {
+        await apiPost("/api/merge/abort", { path: state.active });
+        await loadStatus(encodeURIComponent(state.active));
+      });
       toast("Merge state cleared");
-      await loadStatus(encodeURIComponent(state.active));
     } catch (err) {
       toast(err.message, true);
     }
@@ -528,9 +543,11 @@ async function abortMerge() {
   const ok = confirm("Abort merge? This will discard all staged changes.");
   if (!ok) return;
   try {
-    await apiPost("/api/merge/abort", { path: state.active });
+    await runBlocking("Aborting merge…", async () => {
+      await apiPost("/api/merge/abort", { path: state.active });
+      await loadStatus(encodeURIComponent(state.active));
+    });
     toast("Merge aborted");
-    await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
     toast(err.message, true);
   }
@@ -804,12 +821,16 @@ function updateChangesBar(data) {
 /** Add each live nested repo to .loreignore (as a folder pattern). */
 async function ignoreNested(list) {
   try {
-    for (const f of list) {
-      const path = (f.path || "").replace(/\\/g, "/");
-      await apiPost("/api/ignore", { path: state.active, pattern: `${path}/` });
-    }
+    // One overlay for the whole batch, not per entry — this is N sequential
+    // requests, so it can take real time on a repo with many nested repos.
+    await runBlocking(`Ignoring ${list.length} ${list.length === 1 ? "repository" : "repositories"}…`, async () => {
+      for (const f of list) {
+        const path = (f.path || "").replace(/\\/g, "/");
+        await apiPost("/api/ignore", { path: state.active, pattern: `${path}/` });
+      }
+      await loadStatus(encodeURIComponent(state.active));
+    });
     toast(`Ignored ${list.length} nested ${list.length === 1 ? "repo" : "repos"}`);
-    await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
     toast(err.message, true);
   }
@@ -827,9 +848,16 @@ async function repairRepository() {
   );
   if (!ok) return;
   try {
-    await apiPost("/api/repair", { path: state.active });
-    toast("Repository repaired");
-    await refreshActive();
+    // keepOpen: a rebuild discards local committed history, so it gets an
+    // explicit acknowledgement rather than a modal that vanishes.
+    await runBlocking(
+      "Repairing repository…",
+      async () => {
+        await apiPost("/api/repair", { path: state.active });
+        await refreshActive();
+      },
+      { keepOpen: true, successMessage: "Repository repaired" },
+    );
   } catch (err) {
     toast(err.message, true);
   }
@@ -1081,23 +1109,24 @@ async function createBranch() {
     toast("Branch name required", true);
     return;
   }
-  const goBtn = $("#create-branch-go");
-  if (goBtn) goBtn.disabled = true;
+  // Close before the overlay, not after success: a showModal() dialog sits in
+  // the top layer, above any overlay z-index. The typed name survives a
+  // failure — it's only cleared when the dialog is reopened.
+  $("#create-branch-dialog")?.close?.();
   try {
-    await apiPost("/api/branch/create", {
-      path: state.active,
-      branch: name,
-      category,
+    await runBlocking("Creating branch…", async () => {
+      await apiPost("/api/branch/create", {
+        path: state.active,
+        branch: name,
+        category,
+      });
+      // Block until every view reflects the new branch, so the user cannot act
+      // on stale state (e.g. merge with the old current branch still shown).
+      await refreshActive();
     });
-    // Block until every view reflects the new branch, so the user cannot act
-    // on stale state (e.g. merge with the old current branch still shown).
-    await refreshActive();
     toast(`Created branch ${name}`);
-    $("#create-branch-dialog")?.close?.();
   } catch (err) {
     toast(err.message, true);
-  } finally {
-    if (goBtn) goBtn.disabled = false;
   }
 }
 
@@ -1117,11 +1146,13 @@ async function archiveBranch(branch) {
   const ok = confirm(`Archive branch ${branch.name}?`);
   if (!ok) return;
   try {
-    await apiPost("/api/branch/archive", {
-      path: state.active,
-      branch: branch.name,
+    await runBlocking("Archiving branch…", async () => {
+      await apiPost("/api/branch/archive", {
+        path: state.active,
+        branch: branch.name,
+      });
+      await refreshActive();
     });
-    await refreshActive();
     toast(`Archived ${branch.name}`);
   } catch (err) {
     toast(err.message, true);
@@ -1289,6 +1320,56 @@ function findMissingAddresses(message) {
   const seen = new Set();
   for (const m of text.matchAll(ADDRESS_NOT_FOUND_RE)) seen.add(`${m[1]}-${m[2]}`);
   return [...seen];
+}
+
+/**
+ * Run a one-shot action behind the blocking overlay. The sibling of runOp for
+ * endpoints that answer with a single JSON response rather than a stream:
+ * same modal chrome (title, blocked interaction, status), but no log or
+ * progress bar since there is nothing incremental to show. Exists so actions
+ * that do real server-side work — notably the .lore rebuilds behind
+ * organization change / repair / adopt-remote-id — can't look idle while the
+ * user waits on them.
+ *
+ * Rethrows on failure so each caller's existing catch/toast still runs.
+ * @param {string} title shown as the overlay heading, e.g. "Repairing repository…"
+ * @param {() => Promise<any>} fn the work to await
+ * @param {{keepOpen?: boolean, successMessage?: string}} [opts] `keepOpen`
+ *   leaves the overlay up on success until the user dismisses it (for
+ *   destructive rebuilds that deserve an explicit acknowledgement); otherwise
+ *   it auto-closes. A failure always stays open, regardless.
+ */
+async function runBlocking(title, fn, opts = {}) {
+  const overlay = $("#op-overlay");
+  const logEl = $("#op-log");
+  const statusEl = $("#op-status");
+  const closeBtn = $("#op-close");
+  const pushContentBtn = $("#op-push-content");
+  const progressEl = $("#op-progress");
+  $("#op-title").textContent = title;
+  logEl.textContent = "";
+  logEl.hidden = true; // nothing streamed — restored in finally for runOp's sake
+  progressEl.hidden = true;
+  pushContentBtn.hidden = true;
+  closeBtn.hidden = true;
+  statusEl.textContent = "Working…";
+  statusEl.className = "";
+  overlay.hidden = false;
+  try {
+    const result = await fn();
+    statusEl.textContent = opts.successMessage ?? "Success";
+    statusEl.className = "ok";
+    if (opts.keepOpen) closeBtn.hidden = false;
+    else overlay.hidden = true;
+    return result;
+  } catch (err) {
+    statusEl.textContent = `Failed: ${err.message}`;
+    statusEl.className = "fail";
+    closeBtn.hidden = false;
+    throw err;
+  } finally {
+    logEl.hidden = false;
+  }
 }
 
 /**
@@ -1746,7 +1827,7 @@ function renderServerRepos(repos) {
       `<button type="button" class="p-clone">Clone</button>` +
       `<button type="button" class="p-del">Delete</button>`;
     li.querySelector(".p-clone").onclick = () => cloneServerRepo(r);
-    li.querySelector(".p-del").onclick = () => deleteServerRepo(r);
+    li.querySelector(".p-del").onclick = (e) => deleteServerRepo(r, e.currentTarget);
     ul.appendChild(li);
   }
 }
@@ -1766,19 +1847,32 @@ function cloneServerRepo(r) {
  * URL and id alone, never a local path, so no local working copy's files or
  * `.lore` are touched — even if this repo happens to also be cloned locally.
  */
-async function deleteServerRepo(r) {
+async function deleteServerRepo(r, btn) {
   const warn = r.tracked
     ? "\n\nThis is one of your local working copies — its files on disk and its .lore folder are left untouched; only the server-side repository is removed, leaving this copy orphaned from that remote."
     : "";
   if (!confirm(`Delete "${r.name}" from the server? This cannot be undone.${warn}`)) return;
+  // An in-row busy state rather than the global overlay: this fires from
+  // inside the Server-repositories dialog, which stays open (the list
+  // refreshes in place afterward) — and a showModal() dialog sits above any
+  // overlay z-index, so the overlay would be hidden behind it anyway.
+  const label = btn?.textContent;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Deleting…";
+  }
   try {
     // Act on the server this dialog actually queried, not the input field —
     // it can be blank or stale relative to what's on screen.
     await apiPost("/api/remote-repos", { _method: "DELETE", id: r.id, base: state.serverReposBase });
     toast(`Deleted ${r.name}`);
-    await loadServerRepos();
+    await loadServerRepos(); // re-renders the list, replacing this button
   } catch (err) {
     toast(err.message, true);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
   }
 }
 
@@ -1817,8 +1911,13 @@ function renderDiscoveredServers() {
 
 /** Trigger manual discovery of Lore servers and update the list. */
 async function discoverServers() {
+  // In-button busy state rather than the global overlay: this fires from the
+  // Settings dialog, which holds unsaved input (#settings-remote) that closing
+  // would discard — and a showModal() dialog outranks any overlay z-index.
   const btn = $("#settings-discover");
+  const label = btn.textContent;
   btn.disabled = true;
+  btn.textContent = "Searching…";
   try {
     const data = await apiGet("/api/discover");
     state.discoveredServers = data.discoveredServers || [];
@@ -1832,6 +1931,7 @@ async function discoverServers() {
     toast(err.message, true);
   } finally {
     btn.disabled = false;
+    btn.textContent = label;
   }
 }
 
@@ -1933,12 +2033,19 @@ function wire() {
       return toast("Organization is required and cannot contain '/'", true);
     }
     const path = state.active;
+    // Deferred so the dialog's own form-submit close lands first — a
+    // showModal() dialog sits in the top layer, above any overlay z-index.
     setTimeout(async () => {
       try {
-        await apiPost("/api/org", { path, organization });
-        toast("Organization changed — repository rebuilt");
-        if (state.active === path) loadOrg(path);
-        await loadRepos();
+        await runBlocking(
+          "Changing organization…",
+          async () => {
+            await apiPost("/api/org", { path, organization });
+            if (state.active === path) loadOrg(path);
+            await loadRepos();
+          },
+          { keepOpen: true, successMessage: "Organization changed — repository rebuilt" },
+        );
       } catch (err) {
         toast(err.message, true);
       }
