@@ -59,17 +59,22 @@ function appendEntries(filePath, header, entries) {
 }
 
 /**
- * Append Lore's counterpart entries to an ignore file another VCS tool owns
- * (.gitignore, .p4ignore), tolerating the read-only files Perforce leaves on
- * disk until `p4 edit`. A permission failure is reported rather than thrown, so
- * seeding .loreignore still succeeds when the foreign file cannot be written.
- * @param {string} filePath the foreign ignore file (must already exist)
+ * Append entries to an ignore file, tolerating the read-only state Perforce
+ * leaves a file in on disk until `p4 edit` checks it out. A permission
+ * failure is reported rather than thrown, so callers can treat it as "skip
+ * this one" instead of aborting whatever larger operation they're part of.
+ * Used both for foreign ignore files (.gitignore, .p4ignore) and for
+ * .loreignore itself, since .loreignore can be checked into another VCS too
+ * (in which case it's just as read-only-until-checked-out as anything else).
+ * @param {string} filePath the ignore file (must already exist)
+ * @param {string|null} header comment written above the first batch actually added
+ * @param {string[]} entries
  * @returns {{updated: boolean, blocked: boolean}} updated when entries were
  *   written; blocked when the file exists but is read-only / not writable
  */
-function appendForeignIgnore(filePath) {
+function appendIgnoreTolerant(filePath, header, entries) {
   try {
-    return { updated: appendEntries(filePath, "# Lore files", VCS_IGNORES).length > 0, blocked: false };
+    return { updated: appendEntries(filePath, header, entries).length > 0, blocked: false };
   } catch (err) {
     // Perforce keeps versioned files read-only until `p4 edit`; treat that as a
     // skip, not a failure that aborts the whole setup.
@@ -88,7 +93,7 @@ function appendForeignIgnore(filePath) {
  * best-effort: a read-only Perforce file is reported via *Blocked flags rather
  * than aborting the seed. Idempotent: safe to call on an already-configured repo.
  * @param {string} repoPath working-copy root
- * @returns {{created: boolean, gitignoreUpdated: boolean, gitignoreBlocked: boolean, p4ignoreUpdated: boolean, p4ignoreBlocked: boolean}}
+ * @returns {{created: boolean, loreignoreBlocked: boolean, gitignoreUpdated: boolean, gitignoreBlocked: boolean, p4ignoreUpdated: boolean, p4ignoreBlocked: boolean}}
  */
 export function setupLoreignore(repoPath) {
   const lorePath = join(repoPath, LOREIGNORE);
@@ -125,13 +130,18 @@ export function setupLoreignore(repoPath) {
     }
   }
 
-  appendEntries(lorePath, "# Other VCS files (managed by Git/Perforce, not Lore)", LORE_IGNORES);
+  // .loreignore can itself be checked into another VCS (e.g. Perforce) and
+  // therefore just as read-only-until-checked-out as .gitignore/.p4ignore --
+  // a blocked write here must not abort the rest of setup (created is still
+  // true, the foreign-file seeding below still runs).
+  const own = appendIgnoreTolerant(lorePath, "# Other VCS files (managed by Git/Perforce, not Lore)", LORE_IGNORES);
 
-  const git = gitExists ? appendForeignIgnore(gitPath) : { updated: false, blocked: false };
-  const p4 = p4Exists ? appendForeignIgnore(p4Path) : { updated: false, blocked: false };
+  const git = gitExists ? appendIgnoreTolerant(gitPath, "# Lore files", VCS_IGNORES) : { updated: false, blocked: false };
+  const p4 = p4Exists ? appendIgnoreTolerant(p4Path, "# Lore files", VCS_IGNORES) : { updated: false, blocked: false };
 
   return {
     created,
+    loreignoreBlocked: own.blocked,
     gitignoreUpdated: git.updated,
     gitignoreBlocked: git.blocked,
     p4ignoreUpdated: p4.updated,
@@ -142,11 +152,14 @@ export function setupLoreignore(repoPath) {
 /**
  * Append a single gitignore-style pattern (a file, folder, or *.ext glob) to
  * .loreignore, creating the file if it does not exist yet. No-op if already
- * present.
- * @returns {boolean} whether the pattern was newly added
+ * present. Tolerates .loreignore being read-only (e.g. checked into Perforce
+ * and not checked out) — see appendIgnoreTolerant.
+ * @returns {{added: boolean, blocked: boolean}} added when the pattern was
+ *   newly written; blocked when .loreignore exists but isn't writable
  */
 export function appendIgnorePattern(repoPath, pattern) {
-  return appendEntries(join(repoPath, LOREIGNORE), null, [pattern]).length > 0;
+  const result = appendIgnoreTolerant(join(repoPath, LOREIGNORE), null, [pattern]);
+  return { added: result.updated, blocked: result.blocked };
 }
 
 /** Whether the working copy already has a .loreignore file. */

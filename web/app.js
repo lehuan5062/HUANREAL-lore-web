@@ -733,15 +733,17 @@ async function ignorePattern(pattern) {
 
 async function initLoreignore() {
   try {
-    const { created, gitignoreUpdated, p4ignoreUpdated, p4ignoreBlocked } = await apiPost(
+    const { created, loreignoreBlocked, gitignoreUpdated, p4ignoreUpdated, p4ignoreBlocked } = await apiPost(
       "/api/init-loreignore",
       { path: state.active },
     );
     toast(created ? "Created .loreignore" : "Updated .loreignore");
     if (gitignoreUpdated) toast("Updated .gitignore");
     if (p4ignoreUpdated) toast("Updated .p4ignore");
-    // Perforce keeps .p4ignore read-only until it is opened for edit, so Lore
-    // cannot add its entries there on its own.
+    // Perforce keeps a checked-in file read-only until it is opened for edit,
+    // so Lore cannot add its entries there on its own — this can apply to
+    // .loreignore itself, not just .gitignore/.p4ignore, if it's also tracked.
+    if (loreignoreBlocked) toast(".loreignore is read-only — run p4 edit .loreignore, then retry", true);
     if (p4ignoreBlocked) toast(".p4ignore is read-only — run p4 edit .p4ignore, then retry", true);
     await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
@@ -1333,6 +1335,7 @@ async function runOp(title, path, payload, opts = {}) {
   }
 
   let failureMessage = "";
+  let successCaveat = "";
   let fileOpTotal = 0;
   try {
     await apiStream(path, payload, (ev) => {
@@ -1340,7 +1343,11 @@ async function runOp(title, path, payload, opts = {}) {
       else if (ev.tag === "DONE") {
         if (ev.data.ok) barFillEl.style.width = "100%";
         failureMessage = ev.data.ok ? "" : ev.data.message || "unknown error";
-        statusEl.textContent = ev.data.ok ? "Success" : `Failed: ${failureMessage}`;
+        successCaveat = ev.data.ok ? ev.data.message || "" : "";
+        // A successful op can still carry a caveat (e.g. revert skipped some
+        // read-only files) -- show it instead of a bare "Success" that would
+        // hide it, especially since this overlay can auto-close right after.
+        statusEl.textContent = ev.data.ok ? `Success${ev.data.message ? ` — ${ev.data.message}` : ""}` : `Failed: ${failureMessage}`;
         statusEl.className = ev.data.ok ? "ok" : "fail";
       } else if (PROGRESS_BEGIN_TAGS.has(ev.tag)) {
         progressEl.hidden = false;
@@ -1414,7 +1421,7 @@ async function runOp(title, path, payload, opts = {}) {
   statusEl.textContent = `${doneText} — refreshing…`;
   await refreshActive();
   statusEl.textContent = doneText;
-  if (opts.autoClose && !failureMessage) {
+  if (opts.autoClose && !failureMessage && !successCaveat) {
     overlay.hidden = true;
   } else {
     closeBtn.hidden = false;

@@ -5,7 +5,7 @@
 
 import { createServer } from "node:http";
 import { readFile, stat, readdir } from "node:fs/promises";
-import { existsSync, readFileSync, rmSync, renameSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, renameSync, mkdtempSync, writeFileSync, accessSync, constants as fsConstants } from "node:fs";
 import { join, extname, normalize as normalizePath, dirname, parse as parsePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
@@ -1067,29 +1067,96 @@ function isAddressNotFoundMessage(message) {
 }
 
 /**
+ * Split absolute file paths into ones the OS says are currently writable vs
+ * read-only. Perforce (and similar tools) leave a file read-only on disk
+ * until it's checked out; reverting such a file always fails, but the
+ * native fileReset error for that ("invalid arguments: Failed to reset
+ * staged node") is generic and gives no hint it's a permission issue — nor
+ * does it distinguish "one read-only file in the batch" from "everything
+ * failed," so a single not-checked-out file can otherwise block reverting
+ * everything else in the same request. Checking writability ourselves first
+ * lets the read-only ones be reported clearly and skipped, while the rest
+ * still reverts. A path that doesn't exist yet is treated as writable — it's
+ * a to-be-created entry, not a permission problem.
+ * @param {string[]} paths
+ * @returns {{writable: string[], readOnly: string[]}}
+ */
+function partitionWritable(paths) {
+  const writable = [];
+  const readOnly = [];
+  for (const p of paths) {
+    if (!existsSync(p)) {
+      writable.push(p);
+      continue;
+    }
+    try {
+      accessSync(p, fsConstants.W_OK);
+      writable.push(p);
+    } catch {
+      readOnly.push(p);
+    }
+  }
+  return { writable, readOnly };
+}
+
+/**
  * Revert files to their committed base (fileReset), streaming progress.
- * Reverting a *modified* tracked file realizes its base content back into the
- * working tree, which needs that content in the local store; a lazily/
- * partially-synced repo may not have it yet, so the first attempt fails with
- * an address-not-found DONE. When that happens, pull the missing committed
- * content from the remote (revisionSync, without discarding the working tree)
- * and retry once. If content is still unreachable, finish with the same
- * actionable message the pre-streaming version raised as a 409.
+ * Read-only paths (see partitionWritable) are filtered out up front and
+ * reported as skipped, rather than left to fail the whole batch on Lore's
+ * generic reset error. Reverting a *modified* tracked file realizes its base
+ * content back into the working tree, which needs that content in the local
+ * store; a lazily/partially-synced repo may not have it yet, so the first
+ * attempt fails with an address-not-found DONE. When that happens, pull the
+ * missing committed content from the remote (revisionSync, without
+ * discarding the working tree) and retry once. If content is still
+ * unreachable, finish with the same actionable message the pre-streaming
+ * version raised as a 409.
  * @param {string} rp repository path
  * @param {string[]|undefined} paths absolute file paths, or undefined for whole-tree
  * @returns {AsyncGenerator<import("./errors.mjs").LoreEvt>}
  */
 async function* resetFilesStream(rp, paths) {
+  let targetPaths = paths;
+  let skipped = [];
+  if (Array.isArray(paths)) {
+    const { writable, readOnly } = partitionWritable(paths);
+    targetPaths = writable;
+    skipped = readOnly;
+    if (skipped.length > 0) {
+      const preview = skipped.slice(0, 10).join(", ") + (skipped.length > 10 ? `, and ${skipped.length - 10} more` : "");
+      yield {
+        tag: "LOG",
+        tagRaw: -1,
+        data: {
+          level: "warn",
+          message: `Skipping ${skipped.length} read-only file(s) (likely checked into another VCS and not checked out): ${preview}`,
+        },
+      };
+    }
+  }
+  const skipNote = skipped.length > 0 ? `${skipped.length} file(s) skipped (read-only)` : "";
+
+  if (Array.isArray(targetPaths) && targetPaths.length === 0) {
+    // Every requested path was read-only — nothing left to actually revert.
+    const ok = skipped.length === 0;
+    yield {
+      tag: "DONE",
+      tagRaw: -1,
+      data: { ok, status: ok ? 0 : -1, message: ok ? undefined : `All ${skipped.length} selected file(s) are read-only — check them out first, then retry.` },
+    };
+    return;
+  }
+
   // purge is required to discard newly added (untracked) files/folders — without
   // it, fileReset only reverts already-tracked modified content and silently
   // leaves added entries dirty.
-  const args = { paths, purge: true };
+  const args = { paths: targetPaths, purge: true };
   let failure = null;
   for await (const ev of stream("fileReset", { repositoryPath: rp }, args)) {
     if (ev.tag !== "DONE") {
       yield ev;
     } else if (ev.data.ok) {
-      yield ev;
+      yield { tag: "DONE", tagRaw: -1, data: { ok: true, status: 0, message: skipNote || undefined } };
       return; // succeeded on the first attempt
     } else {
       failure = ev.data.message;
@@ -1117,7 +1184,7 @@ async function* resetFilesStream(rp, paths) {
     if (ev.tag !== "DONE") {
       yield ev;
     } else if (ev.data.ok) {
-      yield ev;
+      yield { tag: "DONE", tagRaw: -1, data: { ok: true, status: 0, message: skipNote || undefined } };
       return;
     } else {
       retryFailure = ev.data.message;
@@ -1587,7 +1654,10 @@ const server = createServer(async (req, res) => {
     if (p === "/api/ignore" && req.method === "POST") {
       const { path: rp, pattern } = await readBody(req);
       if (!rp || !pattern) return sendJson(res, 400, { error: "path and pattern required" });
-      const added = appendIgnorePattern(toUnixPath(rp), pattern);
+      const { added, blocked } = appendIgnorePattern(toUnixPath(rp), pattern);
+      if (blocked) {
+        return sendJson(res, 409, { error: `.loreignore is read-only — check it out (e.g. "p4 edit .loreignore") and try again` });
+      }
       notifyChanged(rp, "ignore");
       return sendJson(res, 200, { ok: true, added });
     }
