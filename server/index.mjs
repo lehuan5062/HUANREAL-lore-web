@@ -406,6 +406,31 @@ async function repairRepo(path, res) {
 }
 
 /**
+ * `renameSync` with retries. On Windows, `fs.watch(...).close()` returns
+ * before the OS has necessarily released the underlying directory handle
+ * (ReadDirectoryChangesW) — a rename attempted immediately afterward can
+ * transiently fail with EPERM/EBUSY even though the watcher was correctly
+ * closed first. A short retry lets that release catch up instead of failing
+ * the whole repair on what is normally a sub-second race.
+ * @param {string} from
+ * @param {string} to
+ * @param {number} [attempts]
+ * @param {number} [delayMs]
+ */
+async function renameWithRetry(from, to, attempts = 5, delayMs = 100) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (err) {
+      const code = err && typeof err === "object" && "code" in err ? err.code : undefined;
+      if ((code !== "EPERM" && code !== "EBUSY") || i === attempts - 1) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+/**
  * Rebuild a working copy's `.lore` in place, re-registering it under
  * `repositoryUrl` while preserving its existing repository id. The old `.lore` is
  * moved aside and restored if the rebuild throws, so a failure never leaves the
@@ -444,12 +469,12 @@ async function recreateLore(path, repositoryUrl, { id: forcedId, requireExisting
   const wasWatched = unwatchRepo(path);
   try {
     rmSync(backup, { recursive: true, force: true });
-    renameSync(dot, backup);
+    await renameWithRetry(dot, backup);
     try {
       await collect("repositoryCreate", { repositoryPath: path, offline: true }, { repositoryUrl, id });
     } catch (err) {
       rmSync(dot, { recursive: true, force: true });
-      renameSync(backup, dot);
+      await renameWithRetry(backup, dot);
       throw err;
     }
     rmSync(backup, { recursive: true, force: true });
@@ -917,24 +942,51 @@ const onlineBranches = new Map();
 const onlineBranchInflight = new Set();
 const ONLINE_BRANCH_TTL_MS = Number(process.env.LORE_WEB_ONLINE_BRANCH_TTL_MS ?? 60_000);
 
+/**
+ * Backoff state for a failing online branch refresh, keyed the same way as
+ * `onlineBranches`. Unlike that map (success-only), this tracks *attempts* so
+ * consecutive failures space themselves out — without it, a remote that stays
+ * slow/unreachable gets re-tried on every render-path trigger the instant the
+ * in-flight guard clears (as soon as a `collect()` call gives up), abandoning
+ * one more uncancellable native call roughly every idle-timeout period,
+ * forever (see server/sdk.mjs's abandonedCallCount tracking).
+ * @type {Map<string, { failCount: number, nextAttemptAt: number }>}
+ */
+const onlineBranchBackoff = new Map();
+const ONLINE_BRANCH_BACKOFF_MAX_MS = 10 * 60_000;
+
 function onlineBranchesKey(repoPath, archived) {
   return `${toUnixPath(repoPath)} branches-online:${archived ? "all" : "active"}`;
 }
 
 /** Drop cached online enumerations for a repo (or all) after a mutation, so the
- *  next refresh re-reads the remote instead of serving a pre-change branch set. */
+ *  next refresh re-reads the remote instead of serving a pre-change branch set.
+ *  Also clears any backoff, so a mutation (which implies the user just
+ *  successfully reached the remote) gets an immediate retry rather than
+ *  waiting out a delay computed from earlier, possibly unrelated failures. */
 function clearOnlineBranches(repoPath) {
-  if (!repoPath || repoPath === "*") return onlineBranches.clear();
+  if (!repoPath || repoPath === "*") {
+    onlineBranches.clear();
+    onlineBranchBackoff.clear();
+    return;
+  }
   const prefix = `${toUnixPath(repoPath)} `;
   for (const key of onlineBranches.keys()) {
     if (key.startsWith(prefix)) onlineBranches.delete(key);
+  }
+  for (const key of onlineBranchBackoff.keys()) {
+    if (key.startsWith(prefix)) onlineBranchBackoff.delete(key);
   }
 }
 
 /**
  * Refresh the cached online branch enumeration in the background: deduped so only
  * one runs per key at a time, and rate-limited by ONLINE_BRANCH_TTL_MS so a
- * failing remote is retried at most once per interval instead of on every refetch.
+ * healthy remote is polled at most once per interval instead of on every refetch.
+ * A failing remote backs off exponentially instead (see onlineBranchBackoff) —
+ * without that, every render-path trigger arriving after the in-flight guard
+ * clears would re-attempt immediately, abandoning one more uncancellable native
+ * call roughly every idle-timeout period for as long as the remote stays bad.
  * Broadcasts a refresh only when the enumeration actually changed, so clients pick
  * up accurate badges without periodic churn. A slow/unreachable remote fails
  * quietly here — it never reaches the render path.
@@ -944,9 +996,12 @@ function refreshOnlineBranches(repoPath, archived) {
   if (onlineBranchInflight.has(key)) return;
   const entry = onlineBranches.get(key);
   if (entry && Date.now() - entry.fetchedAt < ONLINE_BRANCH_TTL_MS) return;
+  const backoff = onlineBranchBackoff.get(key);
+  if (backoff && Date.now() < backoff.nextAttemptAt) return;
   onlineBranchInflight.add(key);
   fetchBranchesOnline(repoPath, archived)
     .then((branches) => {
+      onlineBranchBackoff.delete(key);
       const prev = onlineBranches.get(key);
       onlineBranches.set(key, { branches, fetchedAt: Date.now() });
       if (!prev || JSON.stringify(prev.branches) !== JSON.stringify(branches)) {
@@ -955,6 +1010,9 @@ function refreshOnlineBranches(repoPath, archived) {
     })
     .catch((err) => {
       log.debug("online branch enrichment failed", { key, message: err instanceof Error ? err.message : String(err) });
+      const failCount = (onlineBranchBackoff.get(key)?.failCount ?? 0) + 1;
+      const delay = Math.min(ONLINE_BRANCH_TTL_MS * 2 ** (failCount - 1), ONLINE_BRANCH_BACKOFF_MAX_MS);
+      onlineBranchBackoff.set(key, { failCount, nextAttemptAt: Date.now() + delay });
     })
     .finally(() => onlineBranchInflight.delete(key));
 }

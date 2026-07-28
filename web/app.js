@@ -1166,16 +1166,21 @@ function renderFileOpProgress(barFillEl, textEl, tag, count, total) {
 /** Render progress data (file and byte counts) onto the operation overlay bar.
  * @param {HTMLElement} barFillEl progress bar fill element
  * @param {HTMLElement} textEl progress text element
- * @param {object} data progress payload with fileComplete, fileTotal, bytesTransferred, bytesTotal, discoveryComplete
+ * @param {object} data a REPOSITORY_CLONE_PROGRESS/REVISION_COMMIT_PROGRESS (or
+ *   matching END) event's data — the actual counts (fileComplete, fileTotal,
+ *   bytesTransferred, bytesTotal, discoveryComplete) live nested under `count`,
+ *   confirmed against real captured events; fall back to top-level fields too
+ *   in case some verb's event shape doesn't nest.
  */
 function renderOpProgress(barFillEl, textEl, data) {
-  const fileDone = data.fileComplete ?? data.fileCount ?? 0;
-  const fileTotal = data.fileTotal ?? data.fileCount ?? 0;
-  const bytesDone = data.bytesTransferred ?? 0;
-  const bytesTotal = data.bytesTotal ?? 0;
-  const pct = data.discoveryComplete && bytesTotal > 0 ? (bytesDone / bytesTotal) * 100 : fileTotal > 0 ? (fileDone / fileTotal) * 100 : 0;
+  const count = data.count || data;
+  const fileDone = count.fileComplete ?? count.fileCount ?? 0;
+  const fileTotal = count.fileTotal ?? count.fileCount ?? 0;
+  const bytesDone = count.bytesTransferred ?? 0;
+  const bytesTotal = count.bytesTotal ?? 0;
+  const pct = count.discoveryComplete && bytesTotal > 0 ? (bytesDone / bytesTotal) * 100 : fileTotal > 0 ? (fileDone / fileTotal) * 100 : 0;
   barFillEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
-  textEl.textContent = data.discoveryComplete
+  textEl.textContent = count.discoveryComplete
     ? `${fileDone.toLocaleString()} / ${fileTotal.toLocaleString()} files · ${fmtBytes(bytesDone)} / ${fmtBytes(bytesTotal)}`
     : "Discovering…";
 }
@@ -1275,7 +1280,8 @@ async function runOp(title, path, payload, opts = {}) {
         renderOpProgress(barFillEl, progressTextEl, ev.data || {});
       } else if (PROGRESS_END_TAGS.has(ev.tag)) {
         progressEl.hidden = false;
-        barFillEl.style.width = "100%";
+        renderOpProgress(barFillEl, progressTextEl, { ...ev.data, count: { ...ev.data?.count, discoveryComplete: true } });
+        barFillEl.style.width = "100%"; // END always means done, even a zero-file clone/commit
       } else if (FILE_OP_BEGIN_TAGS.has(ev.tag)) {
         fileOpTotal = ev.data?.pathCount || 0;
         progressEl.hidden = false;
