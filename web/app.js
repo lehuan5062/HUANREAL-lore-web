@@ -23,6 +23,10 @@ const state = {
   // started before a mutation (e.g. a branch switch) can never overwrite the
   // post-mutation state with pre-mutation data.
   refreshSeq: 0,
+  // The base URL the Server repositories dialog last actually queried, so
+  // deleting a row acts on the server shown, not whatever the input field
+  // currently contains (which is blank before the first listing loads).
+  serverReposBase: "",
 };
 
 /** Build an Error carrying the response status and JSON body, so callers can
@@ -547,9 +551,23 @@ function renderFiles(ul, files, action) {
   }
 }
 
+/**
+ * Consume a streamed op (stage/unstage/reset now all stream, per-file included)
+ * without showing the overlay — for a single-file action, a full-screen modal
+ * would be overkill for something that normally finishes instantly. Throws if
+ * the operation's terminal DONE marker reports failure.
+ */
+async function streamSilently(path, payload) {
+  let failureMessage = null;
+  await apiStream(path, payload, (ev) => {
+    if (ev.tag === "DONE" && !ev.data.ok) failureMessage = ev.data.message || "unknown error";
+  });
+  if (failureMessage) throw new Error(failureMessage);
+}
+
 async function fileAction(action, file) {
   try {
-    await apiPost(`/api/${action}`, { path: state.active, files: [file] });
+    await streamSilently(`/api/${action}`, { path: state.active, files: [file] });
     // SSE refresh will follow, but refetch now for immediate feedback.
     await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
@@ -557,28 +575,21 @@ async function fileAction(action, file) {
   }
 }
 
-/** Stages every currently unstaged file in the active repository. */
+/** Stages every currently unstaged file in the active repository. Streams
+ * progress through the op overlay — fileStage's working-tree scan can run well
+ * past a moment on a large repo, and the overlay auto-closes on success so it
+ * doesn't add an extra click to a routine action. */
 async function stageAll() {
   const files = (state.unstaged || []).map((f) => f.path);
   if (files.length === 0) return;
-  try {
-    await apiPost("/api/stage", { path: state.active, files });
-    await loadStatus(encodeURIComponent(state.active));
-  } catch (err) {
-    toast(err.message, true);
-  }
+  await runOp("Staging…", "/api/stage", { path: state.active, files }, { autoClose: true });
 }
 
 /** Unstages every currently staged file in the active repository. */
 async function unstageAll() {
   const files = (state.staged || []).map((f) => f.path);
   if (files.length === 0) return;
-  try {
-    await apiPost("/api/unstage", { path: state.active, files });
-    await loadStatus(encodeURIComponent(state.active));
-  } catch (err) {
-    toast(err.message, true);
-  }
+  await runOp("Unstaging…", "/api/unstage", { path: state.active, files }, { autoClose: true });
 }
 
 /** Reverts every currently unstaged change in the active repository. */
@@ -588,12 +599,7 @@ async function revertAll() {
   const ok = confirm(`Discard all unstaged changes to ${count} file(s)? New files will be deleted. This cannot be undone.`);
   if (!ok) return;
   const files = (state.unstaged || []).map((f) => f.path);
-  try {
-    await apiPost("/api/reset", { path: state.active, files });
-    await loadStatus(encodeURIComponent(state.active));
-  } catch (err) {
-    toast(err.message, true);
-  }
+  await runOp("Reverting…", "/api/reset", { path: state.active, files }, { autoClose: true });
 }
 
 /**
@@ -1118,6 +1124,37 @@ const PROGRESS_BEGIN_TAGS = new Set(["REPOSITORY_CLONE_BEGIN", "REVISION_COMMIT_
 const PROGRESS_TAGS = new Set(["REPOSITORY_CLONE_PROGRESS", "REVISION_COMMIT_PROGRESS"]);
 const PROGRESS_END_TAGS = new Set(["REPOSITORY_CLONE_END", "REVISION_COMMIT_END"]);
 
+// Stage/unstage/reset report progress as running item counts (files and
+// directories touched), not the byte-transfer counters clone/commit use — the
+// BEGIN event's pathCount is the only "total" they ever state, so it has to be
+// captured and carried forward to compute a percentage on PROGRESS/END.
+const FILE_OP_BEGIN_TAGS = new Set(["FILE_STAGE_BEGIN", "FILE_UNSTAGE_BEGIN", "FILE_RESET_BEGIN"]);
+const FILE_OP_PROGRESS_TAGS = new Set(["FILE_STAGE_PROGRESS", "FILE_UNSTAGE_PROGRESS", "FILE_RESET_PROGRESS"]);
+const FILE_OP_END_TAGS = new Set(["FILE_STAGE_END", "FILE_UNSTAGE_END", "FILE_RESET_END"]);
+// Per-file/per-revision detail events — real signal, but one line per file
+// would swamp the log on a large repo, so these are dropped rather than
+// appended to the compact "• TAG" fallback.
+const FILE_OP_NOISE_TAGS = new Set(["FILE_STAGE_FILE", "FILE_UNSTAGE_FILE", "FILE_RESET_FILE", "FILE_STAGE_REVISION", "FILE_UNSTAGE_REVISION"]);
+
+/** Sum of items a FILE_STAGE/UNSTAGE/RESET count struct reports as done so far.
+ * Stage/unstage carry a ready-made totalCount; reset has no single total field,
+ * so its four counters (files and directories, reset and deleted) are summed. */
+function fileOpItemsDone(tag, count) {
+  if (!count) return 0;
+  if (tag.startsWith("FILE_RESET")) {
+    return (count.fileResetCount ?? 0) + (count.fileDeleteCount ?? 0) + (count.directoryResetCount ?? 0) + (count.directoryDeleteCount ?? 0);
+  }
+  return count.totalCount ?? 0;
+}
+
+/** Render stage/unstage/reset progress against the BEGIN event's requested path count. */
+function renderFileOpProgress(barFillEl, textEl, tag, count, total) {
+  const done = fileOpItemsDone(tag, count);
+  const pct = total > 0 ? (done / total) * 100 : 0;
+  barFillEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+  textEl.textContent = total > 0 ? `${done.toLocaleString()} / ${total.toLocaleString()} items` : `${done.toLocaleString()} items`;
+}
+
 /** Render progress data (file and byte counts) onto the operation overlay bar.
  * @param {HTMLElement} barFillEl progress bar fill element
  * @param {HTMLElement} textEl progress text element
@@ -1146,7 +1183,16 @@ function findMissingAddresses(message) {
   return [...seen];
 }
 
-async function runOp(title, path, payload) {
+/**
+ * @param {string} title
+ * @param {string} path
+ * @param {object} payload
+ * @param {{autoClose?: boolean}} [opts] `autoClose` hides the overlay on success
+ *   instead of waiting for the user to click Close — for quick bulk actions
+ *   (stage/unstage/revert all) where a lingering modal is just friction. On
+ *   failure the overlay always stays open, same as every other operation.
+ */
+async function runOp(title, path, payload, opts = {}) {
   const overlay = $("#op-overlay");
   const logEl = $("#op-log");
   const statusEl = $("#op-status");
@@ -1168,6 +1214,7 @@ async function runOp(title, path, payload) {
   overlay.hidden = false;
 
   let failureMessage = "";
+  let fileOpTotal = 0;
   try {
     await apiStream(path, payload, (ev) => {
       if (ev.tag === "LOG") logEl.textContent += (ev.data?.message || "") + "\n";
@@ -1186,6 +1233,20 @@ async function runOp(title, path, payload) {
       } else if (PROGRESS_END_TAGS.has(ev.tag)) {
         progressEl.hidden = false;
         barFillEl.style.width = "100%";
+      } else if (FILE_OP_BEGIN_TAGS.has(ev.tag)) {
+        fileOpTotal = ev.data?.pathCount || 0;
+        progressEl.hidden = false;
+        barFillEl.style.width = "0%";
+        progressTextEl.textContent = fileOpTotal > 0 ? `0 / ${fileOpTotal.toLocaleString()} items` : "Working…";
+      } else if (FILE_OP_PROGRESS_TAGS.has(ev.tag)) {
+        progressEl.hidden = false;
+        renderFileOpProgress(barFillEl, progressTextEl, ev.tag, ev.data?.count, fileOpTotal);
+      } else if (FILE_OP_END_TAGS.has(ev.tag)) {
+        progressEl.hidden = false;
+        barFillEl.style.width = "100%";
+        renderFileOpProgress(barFillEl, progressTextEl, ev.tag, ev.data?.count, fileOpTotal);
+      } else if (FILE_OP_NOISE_TAGS.has(ev.tag)) {
+        // dropped — see FILE_OP_NOISE_TAGS
       } else if (ev.tag !== "END" && ev.tag !== "COMPLETE") {
         // Surface other progress-bearing events compactly.
         logEl.textContent += `• ${ev.tag}\n`;
@@ -1233,7 +1294,11 @@ async function runOp(title, path, payload) {
   statusEl.textContent = `${doneText} — refreshing…`;
   await refreshActive();
   statusEl.textContent = doneText;
-  closeBtn.hidden = false;
+  if (opts.autoClose && !failureMessage) {
+    overlay.hidden = true;
+  } else {
+    closeBtn.hidden = false;
+  }
 }
 
 async function syncToRevision(revision) {
@@ -1444,14 +1509,18 @@ async function loadServerRepos() {
   const server = $("#server-url").value.trim();
   const data = await apiGet(`/api/remote-repos${server ? `?url=${encodeURIComponent(server)}` : ""}`);
   $("#server-url").value = data.base;
+  state.serverReposBase = data.base;
   renderServerRepos(data.repos);
 }
 
 /**
  * Render the repositories the server hosts. Each row offers Clone (hands the
- * remote URL to the clone dialog to pick a destination) and ✕ Delete (removes
- * it from the server by id — see the server's deleteRemoteRepo). Repos already
- * cloned on this machine are tagged so the real ones stand out from stale ones.
+ * remote URL to the clone dialog to pick a destination) and a labeled Delete
+ * (removes it from the server by id — see the server's deleteRemoteRepo).
+ * Repos already cloned on this machine are tagged, and rows the server's name
+ * resolution disagrees with the listing on (`listed: false` / `nameMismatch`,
+ * from `listRemoteRepos`'s repositoryInfo cross-check) are flagged — these are
+ * exactly the phantom name bindings that make a fresh add collide.
  */
 function renderServerRepos(repos) {
   const ul = $("#server-repos");
@@ -1463,11 +1532,15 @@ function renderServerRepos(repos) {
   }
   for (const r of repos) {
     const li = document.createElement("li");
-    const tag = r.tracked ? `<span class="p-tag">cloned</span>` : "";
+    const tags = [];
+    if (r.tracked) tags.push(`<span class="p-tag">cloned</span>`);
+    if (r.listed === false) tags.push(`<span class="p-tag warn" title="Resolves to ${r.resolvedId} but repositoryList does not show it — this is a name binding that can collide with a fresh add.">not listed</span>`);
+    if (r.nameMismatch) tags.push(`<span class="p-tag warn" title="This name currently resolves to ${r.resolvedId}, not the id shown here.">name mismatch</span>`);
+    const title = r.listed === false ? `${r.url} (unlisted — resolves to ${r.resolvedId})` : r.url;
     li.innerHTML =
-      `<span class="p-name" title="${r.url}">${r.name}</span>${tag}` +
+      `<span class="p-name" title="${title}">${r.name}</span>${tags.join("")}` +
       `<button type="button" class="p-clone">Clone</button>` +
-      `<button type="button" class="p-del" title="Delete from server">✕</button>`;
+      `<button type="button" class="p-del danger">Delete</button>`;
     li.querySelector(".p-clone").onclick = () => cloneServerRepo(r);
     li.querySelector(".p-del").onclick = () => deleteServerRepo(r);
     ul.appendChild(li);
@@ -1483,12 +1556,21 @@ function cloneServerRepo(r) {
   $("#clone-dialog").showModal();
 }
 
-/** Delete a server-side repository after confirmation, then refresh the list. */
+/**
+ * Delete a server-side repository after confirmation, then refresh the list.
+ * Only ever removes the repository from the server: it addresses the server by
+ * URL and id alone, never a local path, so no local working copy's files or
+ * `.lore` are touched — even if this repo happens to also be cloned locally.
+ */
 async function deleteServerRepo(r) {
-  const warn = r.tracked ? "\n\nThis is one of your local working copies — its files on disk are left untouched, but it will no longer exist on the server." : "";
+  const warn = r.tracked
+    ? "\n\nThis is one of your local working copies — its files on disk and its .lore folder are left untouched; only the server-side repository is removed, leaving this copy orphaned from that remote."
+    : "";
   if (!confirm(`Delete "${r.name}" from the server? This cannot be undone.${warn}`)) return;
   try {
-    await apiPost("/api/remote-repos", { _method: "DELETE", id: r.id, base: $("#server-url").value.trim() });
+    // Act on the server this dialog actually queried, not the input field —
+    // it can be blank or stale relative to what's on screen.
+    await apiPost("/api/remote-repos", { _method: "DELETE", id: r.id, base: state.serverReposBase });
     toast(`Deleted ${r.name}`);
     await loadServerRepos();
   } catch (err) {

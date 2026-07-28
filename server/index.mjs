@@ -504,11 +504,71 @@ async function adoptRemoteId(req, res) {
 }
 
 /**
+ * Resolve a repository name to the id it is actually bound to on the server,
+ * via `repositoryInfo` (which, unlike `repositoryList`, looks a name up
+ * directly instead of enumerating everything the server currently lists). A
+ * name can be bound on the server without appearing in `repositoryList` — this
+ * is the only way to detect that, and it's what a stuck delete or a fresh
+ * `repositoryCreate` collision actually depends on.
+ * @param {string} base server base URL (no path)
+ * @param {string} name repository name (may include an org prefix)
+ * @returns {Promise<string|null>} the bound id, or null if the name doesn't
+ *   resolve (a normal answer) or the request fails outright
+ */
+async function resolveRemoteName(base, name) {
+  try {
+    const events = await collect("repositoryInfo", {}, { repositoryUrl: `${base}/${name}` });
+    return xform.repositoryInfo(events);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map `items` through `fn`, running at most `limit` calls concurrently.
+ *
+ * Each `fn` call here wraps a `collect()` that can time out but never cancels
+ * its underlying native call (see sdk.mjs) — every one left running abandons a
+ * koffi/libuv threadpool worker for the rest of the process's life (koffi's
+ * async dispatch shares that pool with Node's own fs/dns/crypto/zlib calls).
+ * An unbounded `Promise.all` here would let one dialog-open against a
+ * remote that accepts-but-never-responds leak one thread per repo at once;
+ * capping concurrency bounds that to `limit` regardless of how many repos or
+ * candidate names are being cross-checked.
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+async function mapLimited(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
  * GET /api/remote-repos?url= — ask a Lore server which repositories it hosts, so
  * the user can pick one to clone instead of typing its full URL. The server base
  * comes from the query, falling back to the same default the Add flow suggests
  * (the remote of an already-tracked repo, an env override, or the local server).
  * Each entry is returned with a ready-to-clone URL of the form <base>/<name>.
+ *
+ * `repositoryList` alone is not ground truth: a name can be bound to a
+ * repository id the listing doesn't enumerate, which is exactly what makes
+ * `repositoryCreate` collide on a name that looks free. Every listed name is
+ * cross-checked with `resolveRemoteName`, and so are the names of every
+ * tracked local repo — surfacing `nameMismatch` (the name resolves to a
+ * different id than listed) and `listed: false` (a name that resolves but
+ * appears in no listing entry) entries.
  * @param {import("node:http").ServerResponse} res
  * @param {string|null} rawUrl the server URL to query; empty/null uses the default
  */
@@ -516,15 +576,62 @@ async function listRemoteRepos(res, rawUrl) {
   const base = remoteBase((rawUrl || "").trim() || defaultRemoteBase());
   const events = await collect("repositoryList", {}, { url: base });
   const local = localRepoIds();
+  const listed = xform.remoteRepos(events);
+  const listedNames = new Set(listed.map((r) => r.name));
+
+  // Names of tracked local repos pointed at this same server, so their name
+  // can be cross-checked even if the listing doesn't cover them.
+  const candidateNames = new Set();
+  for (const r of store.listRepos()) {
+    if (!isRepo(r.path)) continue;
+    const remote = readRepoRemote(r.path);
+    if (!remote || remoteBase(remote) !== base) continue;
+    try {
+      const { name } = await readOrg(r.path);
+      if (name && !listedNames.has(name)) candidateNames.add(name);
+    } catch {
+      // metadata unreadable — nothing to cross-check for this repo
+    }
+  }
+
+  // Bounded, not Promise.all — see mapLimited's doc comment for why unbounded
+  // fan-out here is a real resource-exhaustion risk, not just a style choice.
+  const RESOLVE_CONCURRENCY = 3;
+  const [listedResolved, phantomResolved] = await Promise.all([
+    mapLimited(listed, RESOLVE_CONCURRENCY, (r) => resolveRemoteName(base, r.name)),
+    mapLimited([...candidateNames], RESOLVE_CONCURRENCY, (name) => resolveRemoteName(base, name)),
+  ]);
+
   // Address each repo by its id (server-listed names do not resolve for repos
   // created without an owner — see deleteRemoteRepo) but offer the name-based
   // URL for cloning, which the user expects to look like the real remote.
-  const repos = xform.remoteRepos(events).map((r) => ({
-    ...r,
-    url: `${base}/${r.name}`,
-    idUrl: `${base}/${r.id}`,
-    tracked: local.has(r.id),
-  }));
+  const repos = listed.map((r, i) => {
+    const resolvedId = listedResolved[i];
+    return {
+      ...r,
+      url: `${base}/${r.name}`,
+      idUrl: `${base}/${r.id}`,
+      tracked: local.has(r.id),
+      resolvedId,
+      nameMismatch: resolvedId != null && resolvedId !== r.id,
+    };
+  });
+
+  [...candidateNames].forEach((name, i) => {
+    const resolvedId = phantomResolved[i];
+    if (resolvedId == null) return; // doesn't actually resolve — nothing phantom here
+    repos.push({
+      id: resolvedId,
+      name,
+      url: `${base}/${name}`,
+      idUrl: `${base}/${resolvedId}`,
+      tracked: local.has(resolvedId),
+      resolvedId,
+      nameMismatch: false,
+      listed: false,
+    });
+  });
+
   sendJson(res, 200, { base, repos });
 }
 
@@ -543,22 +650,63 @@ function localRepoIds() {
 }
 
 /**
- * DELETE /api/remote-repos — remove a repository from its server by id. Two Lore
- * quirks force the shape of this: (1) repos created without an owner do not
- * resolve by their listed name, only by id; (2) `lore repository delete` prints
- * a spurious "Not found" and exits 0 even when it succeeded. So we delete by id
- * and ignore the CLI's status entirely, confirming the outcome by re-listing —
- * the delete worked iff the id is gone.
+ * DELETE /api/remote-repos — remove a repository from its server by id. Never
+ * touches local content: it addresses the server purely by URL, is never given
+ * `--repository` or `--dry-run` (the latter only guards the local filesystem —
+ * it does not prevent the remote delete), and runs with a neutral `cwd` so it
+ * can never resolve an ambient working copy from this process's own directory.
+ *
+ * A Lore quirk forces the verification to go beyond a simple re-list: repos
+ * created without an owner do not resolve by their listed name, only by id, and
+ * `lore repository delete` exits 0 whether it succeeded or failed — a real
+ * failure prints "Not found" and still returns 0, identically to a delete that
+ * matched nothing. So success is judged by three checks, not the CLI's exit
+ * code: the id is gone from `repositoryList`, no listed entry carries the old
+ * name, and (the decisive one) `resolveRemoteName` no longer resolves that name
+ * to anything — this is what a re-list alone cannot see, and what let a prior
+ * "successful" delete leave the name still bound on the server.
  */
 async function deleteRemoteRepo(req, res) {
   const { id, base: rawBase } = await readBody(req);
   if (!id) return sendJson(res, 400, { error: "id required" });
   const base = remoteBase((rawBase || "").trim() || defaultRemoteBase());
-  log.info("deleting remote repository", { base, id });
-  await runCli(["repository", "delete", `${base}/${id}`]);
-  const events = await collect("repositoryList", {}, { url: base });
-  const stillThere = xform.remoteRepos(events).some((r) => r.id === id);
-  if (stillThere) return sendJson(res, 500, { error: "server did not delete the repository" });
+  const before = xform.remoteRepos(await collect("repositoryList", {}, { url: base }));
+  const target = before.find((r) => r.id === id);
+  if (!target) return sendJson(res, 404, { error: "repository not found on this server" });
+  const { name } = target;
+  log.info("deleting remote repository", { base, id, name });
+
+  const result = await runCli(["repository", "delete", `${base}/${id}`, "--no-pager"], {
+    timeoutMs: 30_000,
+    cwd: tmpdir(),
+  });
+
+  const verify = async () => {
+    const after = xform.remoteRepos(await collect("repositoryList", {}, { url: base }));
+    const idGone = !after.some((r) => r.id === id);
+    const nameGone = !after.some((r) => r.name === name);
+    const resolvedId = await resolveRemoteName(base, name);
+    return { ok: idGone && nameGone && resolvedId == null, resolvedId };
+  };
+
+  let outcome = await verify();
+  if (!outcome.ok) {
+    // The id may be gone from the listing while the name is still bound (the
+    // failure mode this rewrite exists to catch). Retry once against the name
+    // URL — best effort, since the name form of delete has been observed to
+    // reject with "Invalid repository name" even for a legitimate target.
+    await runCli(["repository", "delete", `${base}/${name}`, "--no-pager"], { timeoutMs: 30_000, cwd: tmpdir() });
+    outcome = await verify();
+  }
+
+  if (!outcome.ok) {
+    const cliText = [result.stdout, result.stderr].filter(Boolean).join(" ").trim();
+    const detail = cliText
+      ? `server did not delete the repository (lore reported: ${cliText})`
+      : "server did not delete the repository";
+    const stillBound = outcome.resolvedId ? ` — the name still resolves to ${outcome.resolvedId}` : "";
+    return sendJson(res, 500, { error: `${detail}${stillBound}` });
+  }
   sendJson(res, 200, { ok: true });
 }
 
@@ -848,42 +996,75 @@ function isAddressNotFound(err) {
   return err instanceof LoreVerbError && err.code === LoreErrorCode.ADDRESS_NOT_FOUND;
 }
 
+/** True for a streamed DONE failure message describing a missing content blob.
+ * The streaming path (unlike collect()'s LoreVerbError) carries no error code —
+ * only the free-text message — so this matches the same "Address not found"
+ * text the client already parses (see ADDRESS_NOT_FOUND_RE in web/app.js). */
+function isAddressNotFoundMessage(message) {
+  return /address not found/i.test(String(message ?? ""));
+}
+
 /**
- * Revert files to their committed base (fileReset). Reverting a *modified* tracked
- * file realizes its base content back into the working tree, which needs that
- * content in the local store; a lazily/partially-synced repo may not have it yet,
- * so the first attempt fails with ADDRESS_NOT_FOUND. When that happens, pull the
- * missing committed content from the remote (revisionSync, without discarding the
- * working tree) and retry once. If content is still unreachable, raise an
- * actionable error instead of leaking the raw content address.
+ * Revert files to their committed base (fileReset), streaming progress.
+ * Reverting a *modified* tracked file realizes its base content back into the
+ * working tree, which needs that content in the local store; a lazily/
+ * partially-synced repo may not have it yet, so the first attempt fails with
+ * an address-not-found DONE. When that happens, pull the missing committed
+ * content from the remote (revisionSync, without discarding the working tree)
+ * and retry once. If content is still unreachable, finish with the same
+ * actionable message the pre-streaming version raised as a 409.
  * @param {string} rp repository path
  * @param {string[]|undefined} paths absolute file paths, or undefined for whole-tree
+ * @returns {AsyncGenerator<import("./errors.mjs").LoreEvt>}
  */
-async function resetFiles(rp, paths) {
+async function* resetFilesStream(rp, paths) {
   // purge is required to discard newly added (untracked) files/folders — without
   // it, fileReset only reverts already-tracked modified content and silently
   // leaves added entries dirty.
   const args = { paths, purge: true };
-  try {
-    await collect("fileReset", { repositoryPath: rp }, args);
-  } catch (err) {
-    if (!isAddressNotFound(err)) throw err;
-    log.debug("fileReset missing base content; syncing then retrying", { repo: rp });
-    // reset:false materializes missing committed content without resetting the
-    // working tree over the user's other changes.
-    await collect("revisionSync", { repositoryPath: rp }, { reset: false });
-    try {
-      await collect("fileReset", { repositoryPath: rp }, args);
-    } catch (retryErr) {
-      if (!isAddressNotFound(retryErr)) throw retryErr;
-      const actionable = new LoreVerbError(
-        "File content isn't available locally yet — sync this repo, then retry the revert.",
-        { verb: "fileReset", status: retryErr.status, code: retryErr.code },
-      );
-      actionable.httpStatus = 409;
-      throw actionable;
+  let failure = null;
+  for await (const ev of stream("fileReset", { repositoryPath: rp }, args)) {
+    if (ev.tag !== "DONE") {
+      yield ev;
+    } else if (ev.data.ok) {
+      yield ev;
+      return; // succeeded on the first attempt
+    } else {
+      failure = ev.data.message;
     }
   }
+  if (!isAddressNotFoundMessage(failure)) {
+    yield { tag: "DONE", tagRaw: -1, data: { ok: false, status: -1, message: failure } };
+    return;
+  }
+  log.debug("fileReset missing base content; syncing then retrying", { repo: rp });
+  yield { tag: "LOG", tagRaw: -1, data: { level: "info", message: "Base content missing locally — syncing before retrying the revert…" } };
+  // reset:false materializes missing committed content without resetting the
+  // working tree over the user's other changes.
+  let syncFailure = null;
+  for await (const ev of stream("revisionSync", { repositoryPath: rp }, { reset: false })) {
+    if (ev.tag !== "DONE") yield ev;
+    else if (!ev.data.ok) syncFailure = ev.data.message;
+  }
+  if (syncFailure) {
+    yield { tag: "DONE", tagRaw: -1, data: { ok: false, status: -1, message: syncFailure } };
+    return;
+  }
+  let retryFailure = null;
+  for await (const ev of stream("fileReset", { repositoryPath: rp }, args)) {
+    if (ev.tag !== "DONE") {
+      yield ev;
+    } else if (ev.data.ok) {
+      yield ev;
+      return;
+    } else {
+      retryFailure = ev.data.message;
+    }
+  }
+  const message = isAddressNotFoundMessage(retryFailure)
+    ? "File content isn't available locally yet — sync this repo, then retry the revert."
+    : retryFailure;
+  yield { tag: "DONE", tagRaw: -1, data: { ok: false, status: -1, message } };
 }
 
 /** Read every GET_DATA chunk for a storageGet item into one buffer, keyed by offset. */
@@ -1079,9 +1260,32 @@ async function collectRead(verb, repoPath, args) {
 }
 
 /**
- * Run a streaming verb and pipe its events to the client as newline-delimited
- * JSON (one normalized event per line). Used for long operations (sync, push,
- * clone) so the browser can render live progress. Ends with the DONE marker.
+ * Pipe an async generator of Lore events to the client as newline-delimited
+ * JSON (one normalized event per line), ending with the DONE marker. Used for
+ * both single-verb streams (streamOp) and custom multi-step generators (e.g.
+ * resetFilesStream's sync-and-retry recovery) so the browser can render live
+ * progress either way.
+ * @param {import("node:http").ServerResponse} res
+ * @param {AsyncGenerator<import("./errors.mjs").LoreEvt>} events
+ * @param {string|null} repoPath repo to refresh on completion
+ * @param {string} label used only for the finish log line
+ */
+async function pipeEvents(res, events, repoPath, label) {
+  res.writeHead(200, { "Content-Type": "application/x-ndjson", "Cache-Control": "no-cache" });
+  let ok = false;
+  for await (const ev of events) {
+    if (ev.tag === "DONE") ok = ev.data?.ok;
+    res.write(JSON.stringify(ev) + "\n");
+  }
+  res.end();
+  // A mutating op changes repo state; invalidate cache and tell every client to refetch.
+  if (repoPath) notifyChanged(repoPath, label);
+  log.info("stream op finished", { verb: label, ok });
+}
+
+/**
+ * Run a streaming verb and pipe its events to the client. Used for long
+ * operations (sync, push, clone) so the browser can render live progress.
  * @param {import("node:http").ServerResponse} res
  * @param {string} verb
  * @param {Record<string, unknown>} globalArgs
@@ -1089,16 +1293,7 @@ async function collectRead(verb, repoPath, args) {
  * @param {string|null} repoPath repo to refresh on completion
  */
 async function streamOp(res, verb, globalArgs, args, repoPath) {
-  res.writeHead(200, { "Content-Type": "application/x-ndjson", "Cache-Control": "no-cache" });
-  let ok = false;
-  for await (const ev of stream(verb, globalArgs, args)) {
-    if (ev.tag === "DONE") ok = ev.data?.ok;
-    res.write(JSON.stringify(ev) + "\n");
-  }
-  res.end();
-  // A mutating op changes repo state; invalidate cache and tell every client to refetch.
-  if (repoPath) notifyChanged(repoPath, verb);
-  log.info("stream op finished", { verb, ok });
+  await pipeEvents(res, stream(verb, globalArgs, args), repoPath, verb);
 }
 
 /** One-shot flag for the startup timing below. */
@@ -1309,25 +1504,21 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, { files: xform.revisionFiles(events) });
     }
 
-    // Quick mutating actions answer immediately and broadcast a refresh so every
-    // client refetches; the response body itself carries no refreshed state.
+    // Staging/unstaging/reverting stream progress (like sync/push/clone) rather
+    // than answering once complete — fileStage's scan:true walks the whole
+    // working tree, which can run well past a moment on a large repo, and the
+    // caller needs a live signal that it's working, not stalled.
     if (p === "/api/stage" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
-      await collect("fileStage", { repositoryPath: rp }, { paths: absFiles(rp, files), scan: true });
-      notifyChanged(rp, "stage");
-      return sendJson(res, 200, { ok: true });
+      return await streamOp(res, "fileStage", { repositoryPath: rp }, { paths: absFiles(rp, files), scan: true }, rp);
     }
     if (p === "/api/unstage" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
-      await collect("fileUnstage", { repositoryPath: rp }, { paths: absFiles(rp, files) });
-      notifyChanged(rp, "unstage");
-      return sendJson(res, 200, { ok: true });
+      return await streamOp(res, "fileUnstage", { repositoryPath: rp }, { paths: absFiles(rp, files) }, rp);
     }
     if (p === "/api/reset" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
-      await resetFiles(rp, absFiles(rp, files));
-      notifyChanged(rp, "reset");
-      return sendJson(res, 200, { ok: true });
+      return await pipeEvents(res, resetFilesStream(rp, absFiles(rp, files)), rp, "fileReset");
     }
     // Add a file/folder/extension pattern to .loreignore (created if absent).
     if (p === "/api/ignore" && req.method === "POST") {

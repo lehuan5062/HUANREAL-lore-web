@@ -67,19 +67,47 @@ function messageFromErrors(errors, fallback) {
 }
 
 /**
- * Ceiling on a single `collect()` call, so a native verb that blocks (e.g. on a
- * remote connect the SDK never bounds) can't hang an HTTP response forever.
- * This is a backstop, not the fix: callers on the latency-sensitive read path
- * should pass `offline: true` in globalArgs so the SDK never attempts the
- * remote connect in the first place. The blocked native call keeps running
- * after this fires (it can't be cancelled), but the request it was serving is
- * freed to fail fast.
+ * Idle ceiling on a single `collect()` call: if a native verb goes this long
+ * without making forward progress (e.g. blocked on a remote connect the SDK
+ * never bounds), the call is abandoned rather than hanging an HTTP response
+ * forever. This is a backstop, not the fix: callers on the latency-sensitive
+ * read path should pass `offline: true` in globalArgs so the SDK never
+ * attempts the remote connect in the first place. The blocked native call
+ * keeps running after this fires (it can't be cancelled), but the request it
+ * was serving is freed to fail fast.
+ *
+ * The timer is rearmed on every *non-LOG* event, so it measures silence
+ * between real progress, not total runtime — a verb that keeps emitting real
+ * events (e.g. a `fileStage` scanning a huge working tree) can run
+ * indefinitely without tripping it. LOG events are deliberately excluded from
+ * resetting it: live testing against a connection that accepts a socket but
+ * never speaks the protocol showed the native client's own internal
+ * reconnect/backoff loop emitting a burst of LOG events roughly every 50s
+ * forever, with no other event ever arriving — if LOG counted as progress,
+ * that verb would never be considered stalled and this timeout would never
+ * fire, no matter how long it ran. Only COMPLETE/ERROR/PROGRESS/etc. (and the
+ * terminal iterator-done signal) count as progress.
  */
-const VERB_TIMEOUT_MS = Number(process.env.LORE_WEB_VERB_TIMEOUT_MS ?? 10_000);
+const VERB_IDLE_TIMEOUT_MS = Number(process.env.LORE_WEB_VERB_TIMEOUT_MS ?? 60_000);
+
+/** Sentinel the idle timer resolves with, distinguishing "stalled" from a real iterator result. */
+const IDLE_TIMEOUT = Symbol("idle-timeout");
+
+/**
+ * Count of verb calls abandoned to an idle timeout so far. The SDK exposes no
+ * way to cancel the underlying native call (see collect() below), so each of
+ * these permanently occupies a koffi/libuv threadpool worker for the rest of
+ * the process's life — the pool is shared with Node's own fs/dns/crypto/zlib
+ * calls (see server/start.mjs's UV_THREADPOOL_SIZE comment), so this number
+ * approaching that size is a real signal the process needs restarting, not
+ * just a curiosity. Surfaced in the timeout log line so it's visible without
+ * needing debug-level logging enabled.
+ */
+let abandonedCallCount = 0;
 
 /**
  * Run a Lore verb to completion and return all of its events. Throws a
- * LoreVerbError if the operation fails or times out.
+ * LoreVerbError if the operation fails or stalls.
  * @param {string} verb such as "revisionHistory"
  * @param {Record<string, unknown>} globalArgs at minimum `{ repositoryPath }`
  * @param {Record<string, unknown>} [args] verb-specific arguments
@@ -94,13 +122,43 @@ export async function collect(verb, globalArgs, args = {}) {
   /** @type {string|null} */
   let errorEvent = null;
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-  }, VERB_TIMEOUT_MS);
+  const it = fn(globalArgs, args).asyncIter();
+
+  // One idle timer for the whole call, only replaced when a non-LOG event
+  // proves real progress happened — not recreated on every iteration, or a
+  // verb that emits nothing but LOG chatter would keep resetting its own
+  // deadline forever (see the doc comment above `VERB_IDLE_TIMEOUT_MS`).
+  let timer;
+  function armIdle() {
+    return new Promise((resolve) => {
+      timer = setTimeout(() => resolve(IDLE_TIMEOUT), VERB_IDLE_TIMEOUT_MS);
+    });
+  }
+  let idle = armIdle();
+
   try {
-    for await (const ev of fn(globalArgs, args).asyncIter()) {
-      if (timedOut) break;
-      const n = normalize(ev);
+    for (;;) {
+      const next = it.next();
+      // If idle wins the race, `next` is left pending and can still reject
+      // later (the native call can't be cancelled) with nothing awaiting it —
+      // attach a no-op handler so that doesn't surface as an unhandled
+      // rejection; the race below still observes its real outcome.
+      next.catch(() => {});
+      const step = await Promise.race([next, idle]);
+      if (step === IDLE_TIMEOUT) {
+        timedOut = true;
+        break;
+      }
+      if (step.done) break;
+      const n = normalize(step.value);
+      if (n.tag !== "LOG") {
+        // Real forward progress (or a terminal event) — reset the stall
+        // clock. LOG events do not count, or a verb stuck in a native
+        // reconnect/backoff loop that logs periodically could "stay alive"
+        // indefinitely without ever actually succeeding.
+        clearTimeout(timer);
+        idle = armIdle();
+      }
       if (n.tag === "COMPLETE") {
         status = n.data?.status ?? 0;
         complete = n.data?.error ?? null;
@@ -117,10 +175,30 @@ export async function collect(verb, globalArgs, args = {}) {
     status = status || -1;
   } finally {
     clearTimeout(timer);
+    // Fire-and-forget, never awaited: on a truly stalled verb (e.g. a dead
+    // connect the native side never gives up on), the generator's own cleanup
+    // path is paused on that same never-resolving operation, so `it.return()`
+    // can itself hang forever. Awaiting it here would silently defeat the
+    // entire timeout — the response would never be freed to return, exactly
+    // the failure mode this timeout exists to prevent. Abandon the iterator
+    // without waiting for it to confirm it's done.
+    if (timedOut) it.return?.().catch(() => {});
   }
   if (timedOut) {
-    log.debug("lore verb timed out", { verb, timeoutMs: VERB_TIMEOUT_MS });
-    throw new LoreVerbError(`Lore verb '${verb}' timed out after ${VERB_TIMEOUT_MS}ms`, { verb, status: -1, code: -1 });
+    abandonedCallCount++;
+    // warn, not debug: an abandoned call is a standing resource cost (see
+    // abandonedCallCount's doc comment above), worth seeing without turning on
+    // debug logging, and the running total is the actionable part.
+    log.warn("lore verb timed out; native call abandoned (cannot be cancelled)", {
+      verb,
+      timeoutMs: VERB_IDLE_TIMEOUT_MS,
+      abandonedCallCount,
+    });
+    throw new LoreVerbError(`Lore verb '${verb}' timed out after ${VERB_IDLE_TIMEOUT_MS}ms with no progress`, {
+      verb,
+      status: -1,
+      code: -1,
+    });
   }
   if (status !== 0) {
     const message = errorEvent || complete?.message || `Lore verb '${verb}' failed`;

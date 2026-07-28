@@ -141,6 +141,16 @@ export function remoteRepos(events) {
     .map((e) => ({ id: e.data?.id, name: e.data?.name }));
 }
 
+/**
+ * The repository id a name resolves to on the server, from `repositoryInfo`.
+ * @param {LoreEvt[]} events
+ * @returns {string|null} the bound id, or null if no REPOSITORY_DATA event arrived
+ */
+export function repositoryInfo(events) {
+  const e = events.find((ev) => ev.tag === "REPOSITORY_DATA");
+  return e?.data?.id ?? null;
+}
+
 /** Collect repository metadata key/values from `repositoryMetadataGet`. @param {LoreEvt[]} events */
 export function metadata(events) {
   /** @type {Record<string, any>} */

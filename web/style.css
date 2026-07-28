@@ -264,10 +264,12 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 #server-repos .p-name { margin-right: auto; }
 #server-repos .p-tag { margin-left: 0; }
 #server-repos .p-clone { margin-left: 8px; border: 1px solid var(--border); background: var(--panel-2); color: var(--fg, inherit); cursor: pointer; font-size: 11px; padding: 2px 8px; border-radius: 4px; opacity: 0; }
-#server-repos .p-del { margin-left: 6px; border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 6px; border-radius: 4px; opacity: 0; }
-#server-repos li:hover .p-clone, #server-repos li:hover .p-del { opacity: 1; }
+/* Delete is a real, always-visible labeled button (not a hover-reveal ✕) — it
+   must be obvious this repository can be removed from the server. */
+#server-repos .p-del { margin-left: 6px; font-size: 11px; padding: 2px 8px; border-radius: 4px; }
+#server-repos li:hover .p-clone { opacity: 1; }
 #server-repos .p-clone:hover { border-color: var(--accent); color: var(--accent); }
-#server-repos .p-del:hover { background: var(--danger, #c0392b); color: #fff; }
+.picker-list .p-tag.warn { color: var(--warn, #e0a030); border-color: var(--warn, #e0a030); }
 .picker-new { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
 .picker menu { display: flex; gap: 8px; justify-content: flex-end; margin: 0; padding: 0; }
 

@@ -8,7 +8,16 @@
 // the port is bound (see server/sdk-lazy.mjs), happens well after this module
 // runs. Setting it here still takes effect; it just no longer has to beat an
 // import to do so.
-if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = "16";
+//
+// This is also the only real mitigation for a harder problem: the SDK exposes
+// no way to cancel or time out a stuck native call (see collect()'s idle
+// timeout in sdk.mjs), so a verb that blocks forever on an unresponsive remote
+// permanently occupies one worker thread for the rest of the process's life.
+// Enough of those exhaust the pool and stall every other async call in the
+// process, Lore-related or not (fs, dns, crypto, zlib all share it too).
+// Raising this only buys headroom — it cannot fix the underlying leak — but
+// headroom is cheap (threads here are lightweight), so size it generously.
+if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = "32";
 
 import { spawn, spawnSync } from "node:child_process";
 import { connect } from "node:net";
