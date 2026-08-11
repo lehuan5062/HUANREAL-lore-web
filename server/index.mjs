@@ -22,11 +22,11 @@ import { sinceLaunch } from "./launch.mjs";
 import { LoreErrorCode } from "@lore-vcs/sdk/types/enums";
 import * as store from "./store.mjs";
 import * as xform from "./transforms.mjs";
-import { addClient, broadcastRefresh } from "./events.mjs";
+import { addClient, broadcastRefresh, broadcastNotice } from "./events.mjs";
 import { watchRepo, unwatchRepo } from "./watcher.mjs";
-import { isLoggedIn, runCli } from "./cli.mjs";
+import { isLoggedIn, runCli, runCliJson } from "./cli.mjs";
 import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore, hasP4ignore } from "./loreignore.mjs";
-import { discoverServers } from "./discovery.mjs";
+import { discoverServers, testServer } from "./discovery.mjs";
 import * as cache from "./cache.mjs";
 import { parseAddress } from "./address.mjs";
 
@@ -53,6 +53,23 @@ function readArgs(repoPath) {
 }
 
 /**
+ * Rewrite host `localhost` to `127.0.0.1` in a lore remote URL. The Lore
+ * server binds IPv4 only, and Windows resolves `localhost` to `::1` first, so
+ * a `localhost` remote pays a full handshake timeout on IPv6 before falling
+ * back on every remote-touching operation (measured on this setup: 31s vs
+ * 0.14s for the identical call). Any URL the app *generates* — init
+ * suggestions, clone targets — gets normalized so new repos never inherit the
+ * trap; URLs merely displayed from existing configs are left as-is.
+ * @param {string} url a remote URL, possibly with a `localhost` host
+ * @returns {string} the same URL with `localhost` replaced by `127.0.0.1`
+ */
+function normalizeLoopback(url) {
+  const normalized = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)localhost(?=[:/]|$)/i, "$1127.0.0.1");
+  if (normalized !== url) log.debug("normalized localhost remote to 127.0.0.1", { url });
+  return normalized;
+}
+
+/**
  * The remote server base to assign when initializing a brand-new repository, so
  * the user never types one. Reads from configured default remote, falls back to
  * an already-tracked repo's remote, or the default local Lore server. The repo
@@ -62,7 +79,7 @@ function readArgs(repoPath) {
  */
 function defaultRemoteBase() {
   const configured = store.getDefaultRemote();
-  if (configured) return configured;
+  if (configured) return normalizeLoopback(configured);
 
   for (const r of store.listRepos()) {
     for (const name of ["config.toml", "config"]) {
@@ -70,7 +87,7 @@ function defaultRemoteBase() {
       if (!existsSync(cfg)) continue;
       try {
         const m = readFileSync(cfg, "utf8").match(/^\s*remote_url\s*=\s*"([^"]+)"/m);
-        if (m && m[1]) return m[1];
+        if (m && m[1]) return normalizeLoopback(m[1]);
       } catch {
         // unreadable config — keep looking
       }
@@ -92,6 +109,24 @@ function readRepoRemote(repoPath) {
     }
   }
   return null;
+}
+
+/**
+ * Cheap TCP pre-flight for a verb that must reach the repo's remote. The native
+ * lib has no fast failure path — against a down server a remote-touching verb
+ * emits nothing until the 60s idle timeout fires, and each such abandoned call
+ * permanently leaks a threadpool worker (see server/sdk.mjs). Probing the
+ * host:port ourselves first (~1s worst case) turns that into an immediate,
+ * actionable error instead.
+ * @param {string} repoPath
+ * @returns {Promise<string|null>} the remote URL if it is UNreachable, null if reachable/unknown
+ */
+async function remoteUnreachable(repoPath) {
+  const remote = readRepoRemote(repoPath) ?? defaultRemoteBase();
+  const m = remote.match(/^[a-z][a-z0-9+.-]*:\/\/([^/:]+)(?::(\d+))?/i);
+  if (!m) return null; // unparseable — let the verb try rather than false-positive
+  const reachable = await testServer(m[1], Number(m[2] ?? 41337), 1500);
+  return reachable ? null : remote;
 }
 
 /** The scheme://authority prefix of a URL, with any path/repo component dropped. */
@@ -136,6 +171,51 @@ function notifyChanged(repoPath, reason) {
   // so it needs its own invalidation on a mutation that could change branches.
   clearOnlineBranches(repoPath);
   broadcastRefresh(repoPath, reason);
+}
+
+// ---- Dirty-marking from filesystem events --------------------------------
+// Lore reports a modified tracked file in `status` only once it has been told
+// the file is dirty. Discovering that itself means `scan: true`, which walks
+// the entire working tree, runs on the *write* path (it persists a refreshed
+// staged state), and fails outright on a repo missing any structural blob —
+// exactly the state that made changes invisible in the UI. The watcher already
+// knows which paths changed, so forward them to `fileDirty` (the same thing
+// `lore dirty` does: "inform Lore of the change without performing a full
+// --scan") and then read a cheap `scan: false` status.
+
+/** Repo-relative paths seen by the watcher and not yet handed to fileDirty. @type {Map<string, Set<string>>} */
+const pendingDirty = new Map();
+
+/** Queue watcher-reported paths for the next fileDirty flush on this repo. */
+function markPendingDirty(repoPath, changed) {
+  if (!Array.isArray(changed) || changed.length === 0) return;
+  let set = pendingDirty.get(repoPath);
+  if (!set) pendingDirty.set(repoPath, (set = new Set()));
+  for (const rel of changed) set.add(rel);
+}
+
+/**
+ * Hand any queued paths to `fileDirty` so the next status read sees them.
+ * Best-effort: a failure here must not fail the status request — the caller
+ * still gets whatever Lore already knows about, and the paths are dropped
+ * rather than retried forever (the next filesystem event re-queues them).
+ * @param {string} repoPath
+ */
+async function flushPendingDirty(repoPath) {
+  const set = pendingDirty.get(repoPath);
+  if (!set || set.size === 0) return;
+  pendingDirty.delete(repoPath);
+  const paths = [...set].map((rel) => join(repoPath, rel));
+  try {
+    await collect("fileDirty", { repositoryPath: repoPath }, { paths });
+    log.debug("marked watcher-reported paths dirty", { path: repoPath, count: paths.length });
+  } catch (err) {
+    log.warn("fileDirty for watcher-reported paths failed", {
+      path: repoPath,
+      count: paths.length,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 // A persisted cache entry is served stale-but-instant on the first read after
@@ -290,7 +370,31 @@ async function readOrg(repoPath) {
  */
 async function getOrg(res, repoPath) {
   if (!repoPath) return sendJson(res, 400, { error: "path required" });
-  return sendJson(res, 200, await readOrg(repoPath));
+  const org = await readOrg(repoPath);
+  // Lore stores the organization only as an `org/` prefix on the LOCAL `name`
+  // metadata; the server does not keep it, so a clone (or any `.lore` rebuild)
+  // drops it with nothing to restore it from. Remember it while we can see it,
+  // and when it's gone, hand the client the remembered value so it can offer to
+  // put it back rather than silently showing a repo with no organization.
+  if (org.organization) {
+    store.rememberOrganization(repoPath, org.organization);
+    return sendJson(res, 200, org);
+  }
+  const summary = await repoSummarySafe(repoPath);
+  const restorable = store.rememberedOrganization(repoPath, summary?.repository);
+  return sendJson(res, 200, { ...org, ...(restorable ? { restorableOrganization: restorable } : {}) });
+}
+
+/** Repo summary (id/branch/revision) or null — used where a failure should not
+ *  fail the caller, e.g. resolving an id purely to look something up. */
+async function repoSummarySafe(repoPath) {
+  try {
+    const events = await collect("repositoryStatus", readArgs(repoPath), { staged: false });
+    return xform.repoSummary(events);
+  } catch (err) {
+    log.debug("repo summary lookup failed", { path: repoPath, message: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
 }
 
 /**
@@ -323,6 +427,9 @@ async function setOrg(req, res) {
   const repositoryUrl = `${base}/${organization}/${repoName}`;
   log.info("changing organization", { path, from: current.organization, to: organization });
   const id = await recreateLore(path, repositoryUrl, { requireExistingId: true });
+  // Persist it: this is the only copy that survives a future clone or `.lore`
+  // rebuild, since lore keeps the org only in local metadata (see getOrg).
+  store.rememberOrganization(path, organization, id || undefined);
   notifyChanged("*", "setOrg");
   return sendJson(res, 200, { ...xform.splitOrg(`${organization}/${repoName}`), id });
 }
@@ -374,7 +481,10 @@ async function addRepo(req, res) {
     initialized = true;
   }
   const entry = store.addRepo(path, label);
-  watchRepo(path, () => notifyChanged(path, "fs"));
+  watchRepo(path, (changed) => {
+    markPendingDirty(path, changed);
+    notifyChanged(path, "fs");
+  });
   notifyChanged("*", "addRepo");
   sendJson(res, 200, { repo: entry, initialized });
 }
@@ -481,7 +591,10 @@ async function recreateLore(path, repositoryUrl, { id: forcedId, requireExisting
     setupLoreignore(path);
   } finally {
     if (wasWatched) {
-      watchRepo(path, () => notifyChanged(path, "fs"));
+      watchRepo(path, (changed) => {
+        markPendingDirty(path, changed);
+        notifyChanged(path, "fs");
+      });
     }
   }
   return id;
@@ -523,7 +636,10 @@ async function adoptRemoteId(req, res) {
     setupLoreignore(path);
   }
   const entry = store.addRepo(path, label);
-  watchRepo(path, () => notifyChanged(path, "fs"));
+  watchRepo(path, (changed) => {
+    markPendingDirty(path, changed);
+    notifyChanged(path, "fs");
+  });
   notifyChanged("*", "adoptRemoteId");
   sendJson(res, 200, { repo: entry, id: remoteId });
 }
@@ -602,7 +718,14 @@ async function mapLimited(items, limit, fn) {
  */
 async function listRemoteRepos(res, rawUrl) {
   const base = remoteBase((rawUrl || "").trim() || defaultRemoteBase());
-  const events = await collect("repositoryList", {}, { url: base });
+  // HYBRID: CLI rather than SDK — same reasoning as fetchBranchesOnline. This
+  // enumerates a remote server, so it can stall on an unreachable or slow host,
+  // and every stalled SDK call leaks a threadpool worker permanently (no
+  // cancellation; LORE_BUG_PROMPTS.md P5 BUG 1). The subprocess is killable.
+  // A `cwd` outside any working copy keeps the CLI from resolving an ambient
+  // repository, matching what deleteRemoteRepo already does.
+  // REVERT TO THE SDK once lore-js ships call cancellation.
+  const events = await runCliJson(["repository", "list", base], { timeoutMs: 30_000, cwd: tmpdir() });
   const local = localRepoIds();
   const repos = xform.remoteRepos(events).map((r) => ({
     ...r,
@@ -877,8 +1000,79 @@ async function fetchStatus(repoPath, scan) {
   return data;
 }
 
+/** True for a failure meaning "the local store lacks committed content this
+ * read needs" — either a typed/text address-not-found, or the native lib's
+ * bare "Not found" (lore-base error.rs), which is what offline reads raise
+ * against a lazily-populated fresh clone whose state isn't materialized yet. */
+function isMissingLocalContent(err, message) {
+  return isAddressNotFound(err) || isAddressNotFoundMessage(message) || /^not found$/i.test(String(message ?? "").trim());
+}
+
+/** In-flight materializing syncs, one per repo, so status scan + history (etc.)
+ * failing at the same time share a single revisionSync instead of stacking them. */
+const materializeInflight = new Map();
+
+/** Pull missing committed content from the remote without touching the working
+ * tree (revisionSync reset:false), deduped per repo. */
+function materializeCommitted(repoPath) {
+  let p = materializeInflight.get(repoPath);
+  if (!p) {
+    p = collect("revisionSync", { repositoryPath: repoPath }, { reset: false }).finally(() => materializeInflight.delete(repoPath));
+    materializeInflight.set(repoPath, p);
+  }
+  return p;
+}
+
+/**
+ * Run an offline read that may need committed content not yet in the local
+ * store, with the same recovery the revert path uses. A lazily/partially
+ * synced repo (fresh clone especially) fails such reads with
+ * "Address not found: …" or a bare "Not found" — permanently, from the
+ * caller's point of view, since nothing on the read path fetches. When that
+ * happens and the remote is reachable, pull the missing committed content
+ * (revisionSync without touching the working tree) and retry once.
+ * @template T
+ * @param {string} repoPath repository path
+ * @param {() => Promise<T>} fn the read to run (and retry once after recovery)
+ * @param {string} what label for the log line, e.g. "status scan"
+ * @returns {Promise<T>}
+ */
+async function withMaterializeRetry(repoPath, fn, what) {
+  try {
+    return await fn();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!isMissingLocalContent(err, message)) throw err;
+    if (await remoteUnreachable(repoPath)) throw err; // can't recover offline — surface the original error
+    log.warn(`${what} missing local content; syncing then retrying`, { path: repoPath, message });
+    await materializeCommitted(repoPath);
+    return await fn();
+  }
+}
+
+/**
+ * fetchStatus with missing-content recovery: a full (`scan: true`) status diff
+ * needs committed base content in the local store — see withMaterializeRetry.
+ * @param {string} repoPath repository path
+ * @param {boolean} scan whether to run the full working-tree scan
+ */
+function fetchStatusWithRecovery(repoPath, scan) {
+  return withMaterializeRetry(repoPath, () => fetchStatus(repoPath, scan), "status scan");
+}
+
 /** Repo paths with a background full status scan currently in flight, to avoid starting duplicates. */
 const scanningRepos = new Set();
+
+/**
+ * When the full scan fails for a repo, don't re-attempt it on every subsequent
+ * status read. A repo missing a structural blob fails the scan *permanently*,
+ * and retrying per read costs a doomed full-tree walk and re-toasts the same
+ * warning every time. Watcher-driven fileDirty (see markPendingDirty) keeps
+ * changes flowing meanwhile, so the scan is a fallback, not the main path.
+ * @type {Map<string, number>} repo path → epoch ms before which not to retry
+ */
+const scanBackoff = new Map();
+const SCAN_BACKOFF_MS = 10 * 60_000;
 
 /**
  * Kick off the full working-tree scan in the background after a fast
@@ -892,14 +1086,30 @@ const scanningRepos = new Set();
  */
 function startBackgroundScan(repoPath, key) {
   if (scanningRepos.has(repoPath)) return;
+  const retryAfter = scanBackoff.get(repoPath);
+  if (retryAfter !== undefined && Date.now() < retryAfter) return;
   scanningRepos.add(repoPath);
-  fetchStatus(repoPath, true)
+  fetchStatusWithRecovery(repoPath, true)
     .then((data) => {
+      scanBackoff.delete(repoPath);
       cache.put(key, data);
       broadcastRefresh(repoPath, "scan");
     })
     .catch((err) => {
-      log.debug("background status scan failed", { path: repoPath, message: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      // Not just debug noise: if this fails, the cached fast (scan:false)
+      // result — which is missing untracked files — is what keeps rendering.
+      // Notify once per backoff window, not once per status read.
+      const first = !scanBackoff.has(repoPath);
+      scanBackoff.set(repoPath, Date.now() + SCAN_BACKOFF_MS);
+      log.warn("background status scan failed", { path: repoPath, message, retryInMs: SCAN_BACKOFF_MS });
+      if (first) {
+        broadcastNotice(
+          repoPath,
+          "warn",
+          `Full change scan failed for this repo, so newly discovered files may be missing — edits you make are still tracked. (${message})`
+        );
+      }
     })
     .finally(() => scanningRepos.delete(repoPath));
 }
@@ -927,7 +1137,25 @@ async function fetchBranchesOffline(repoPath, archived) {
  * called from the background refresh below, never on the render path.
  */
 async function fetchBranchesOnline(repoPath, archived) {
-  const events = await collect("branchList", { repositoryPath: repoPath }, { archived });
+  // HYBRID: runs through the CLI, not the SDK, because this is THE call that
+  // hung in production against a slow/unreachable remote — it is why
+  // onlineBranchBackoff and the TCP pre-probe below exist. The SDK has no
+  // cancellation, so each hang permanently occupies a koffi/libuv threadpool
+  // worker for the life of the process (see sdk.mjs `abandonedCallCount`, and
+  // LORE_BUG_PROMPTS.md P5 BUG 1); enough of them and every verb times out
+  // until lore-web is restarted. A hung CLI subprocess is simply killed by
+  // runCliJson's timeout, so the cost is bounded and does not accumulate.
+  // REVERT TO THE SDK once lore-js ships call cancellation (P5 BUG 1) —
+  // `scripts/check-lore-updates.mjs` prints the checklist.
+  // NOTE: no `--remote` flag. Plain `branch list` enumerates BOTH sides
+  // (verified: local:main, local:Phuong2, remote:Phuong2, remote:main), which is
+  // what the badges need. `--remote` returns remote entries ONLY, which would
+  // leave the client's `location === 0` set empty and silently drop every
+  // "local only" badge instead of erroring.
+  const events = await runCliJson(["branch", "list", ...(archived ? ["--archived"] : [])], {
+    repoPath,
+    timeoutMs: 30_000,
+  });
   return xform.branches(events);
 }
 
@@ -999,7 +1227,14 @@ function refreshOnlineBranches(repoPath, archived) {
   const backoff = onlineBranchBackoff.get(key);
   if (backoff && Date.now() < backoff.nextAttemptAt) return;
   onlineBranchInflight.add(key);
-  fetchBranchesOnline(repoPath, archived)
+  // Probe the remote before invoking the verb: a down server would otherwise
+  // cost a 60s idle timeout AND permanently leak a threadpool worker per
+  // attempt (see server/sdk.mjs abandonedCallCount).
+  remoteUnreachable(repoPath)
+    .then((unreachable) => {
+      if (unreachable) throw new Error(`remote ${unreachable} is unreachable`);
+      return fetchBranchesOnline(repoPath, archived);
+    })
     .then((branches) => {
       onlineBranchBackoff.delete(key);
       const prev = onlineBranches.get(key);
@@ -1167,6 +1402,21 @@ async function* resetFilesStream(rp, paths) {
     return;
   }
   log.debug("fileReset missing base content; syncing then retrying", { repo: rp });
+  // The recovery sync below must reach the remote. Fail fast with a clear
+  // message if it's down, instead of hanging for the 60s idle timeout.
+  const unreachable = await remoteUnreachable(rp);
+  if (unreachable) {
+    yield {
+      tag: "DONE",
+      tagRaw: -1,
+      data: {
+        ok: false,
+        status: -1,
+        message: `Reverting needs base content that isn't in the local store yet, and the Lore server at ${unreachable} is unreachable. Start the server (and any VPN/tailnet it needs), then retry the revert.`,
+      },
+    };
+    return;
+  }
   yield { tag: "LOG", tagRaw: -1, data: { level: "info", message: "Base content missing locally — syncing before retrying the revert…" } };
   // reset:false materializes missing committed content without resetting the
   // working tree over the user's other changes.
@@ -1194,6 +1444,102 @@ async function* resetFilesStream(rp, paths) {
     ? "File content isn't available locally yet — sync this repo, then retry the revert."
     : retryFailure;
   yield { tag: "DONE", tagRaw: -1, data: { ok: false, status: -1, message } };
+}
+
+/**
+ * Switch branches, rolling the working tree back if the switch fails partway.
+ *
+ * `branchSwitch` realizes the target branch's files one at a time and, if any
+ * needed content is unavailable, aborts *without* undoing what it already
+ * wrote — leaving a tree that is neither branch. Observed for real: a failed
+ * switch on a freshly cloned repo left 127 changed entries (29 modified, 18
+ * added, 80 deleted) while still reporting the old branch, which a user could
+ * easily have staged and committed as a mixed tree.
+ *
+ * Predicting the failure up front isn't practical: a `dryRun` switch verifies
+ * the delta against the filesystem but never reads content, so it reports
+ * success on a switch that really fails, and `revisionSync` to the target
+ * revision would realize that state — as destructive as the switch itself. So
+ * instead of predicting, this makes failure non-destructive: revert the tree
+ * back to the branch we were on.
+ *
+ * Only rolls back when the tree was verifiably clean beforehand — otherwise the
+ * revert could discard the user's own pre-existing edits, so those are left
+ * untouched and reported instead.
+ * @param {string} rp repository path
+ * @param {{branch: string, reset?: boolean, revision?: string}} args branchSwitch args
+ * @returns {AsyncGenerator<import("./errors.mjs").LoreEvt>}
+ */
+async function* switchBranchStream(rp, args) {
+  let wasClean = false;
+  let prevBranch = "";
+  try {
+    // Mark watcher-seen paths dirty first, or the clean check runs against a
+    // scan:false view that can't see freshly edited/created files and would
+    // wrongly call a dirty tree clean. (The rollback below reads the same view,
+    // so anything still invisible here is also invisible to the revert and
+    // therefore can't be destroyed by it — but the check should be honest.)
+    await flushPendingDirty(rp);
+    const before = await fetchStatus(rp, false);
+    wasClean = (before.files || []).length === 0;
+    prevBranch = before.branch || "";
+  } catch (err) {
+    // Couldn't read the pre-state, so we can't prove the tree was clean —
+    // proceed, but don't touch anything afterwards.
+    log.warn("branch switch: pre-state read failed; rollback disabled for this attempt", {
+      path: rp,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  let failure = null;
+  for await (const ev of stream("branchSwitch", { repositoryPath: rp }, args)) {
+    if (ev.tag !== "DONE") {
+      yield ev;
+    } else if (ev.data.ok) {
+      yield ev;
+      return;
+    } else {
+      failure = ev.data.message;
+    }
+  }
+
+  if (!wasClean) {
+    yield {
+      tag: "DONE",
+      tagRaw: -1,
+      data: {
+        ok: false,
+        status: -1,
+        message: `${failure} — the working tree had local changes before this switch, so it was left untouched; it may now contain a mix of both branches. Review the Changes tab before committing.`,
+      },
+    };
+    return;
+  }
+
+  yield { tag: "LOG", tagRaw: -1, data: { level: "warn", message: `Branch switch failed; restoring the ${prevBranch || "previous"} working tree…` } };
+  let restoreNote = `your working tree was restored to ${prevBranch || "the previous branch"}`;
+  try {
+    const after = await fetchStatus(rp, false);
+    const paths = (after.files || []).filter((f) => !f.flagStaged).map((f) => join(rp, f.path));
+    if (paths.length > 0) {
+      // fileReset needs explicit paths — it silently no-ops (and still reports
+      // success) when given none.
+      let resetFailure = null;
+      for await (const ev of resetFilesStream(rp, paths)) {
+        if (ev.tag !== "DONE") yield ev;
+        else if (!ev.data.ok) resetFailure = ev.data.message;
+      }
+      if (resetFailure) restoreNote = `restoring the working tree also failed (${resetFailure}) — review the Changes tab`;
+      else log.info("branch switch failed; working tree restored", { path: rp, branch: prevBranch, reverted: paths.length });
+    } else {
+      restoreNote = "no changes were left behind in your working tree";
+    }
+  } catch (err) {
+    restoreNote = `restoring the working tree also failed (${err instanceof Error ? err.message : String(err)}) — review the Changes tab`;
+  }
+
+  yield { tag: "DONE", tagRaw: -1, data: { ok: false, status: -1, message: `${failure} — ${restoreNote}.` } };
 }
 
 /** Read every GET_DATA chunk for a storageGet item into one buffer, keyed by offset. */
@@ -1301,6 +1647,57 @@ async function forceReupload(handle, partition, address) {
  * @param {{hash: string, context: string}[]} addresses
  * @returns {Promise<{hash: string, context: string, alreadyDurable: boolean, errorCode: number, backupPath?: string}[]>}
  */
+/**
+ * Which of these addresses can THIS machine actually supply — i.e. are readable
+ * from the local store right now.
+ *
+ * Offering "Push missing content" without knowing this is how a user ends up
+ * clicking a button that can only fail: if the bytes aren't here, there is
+ * nothing to upload and the verb reports an opaque "N/N upload items failed".
+ *
+ * The probe is a real (assembling) read against a local-only handle, not a
+ * metadata query, because metadata lies about fragmented payloads: a chunked
+ * file's reference list can be present while its data chunks are gone, and only
+ * a read touches the chunks (measured: a 1.2 MB asset whose parent fragment
+ * queried fine and whose read failed).
+ * @param {string} rp repository path
+ * @param {{hash: string, context: string}[]} addresses
+ * @returns {Promise<Set<string>>} `hash-context` keys this machine can supply
+ */
+async function locallyAvailableAddresses(rp, addresses) {
+  const available = new Set();
+  if (addresses.length === 0) return available;
+  try {
+    const statusEvents = await collect("repositoryStatus", { repositoryPath: rp }, { staged: false });
+    const { repository: partition } = xform.repoSummary(statusEvents);
+    if (!partition) return available;
+    // No remote config: a hit here proves the bytes are on this machine.
+    const openEvents = await collect("storageOpen", {}, { repositoryPath: rp });
+    const opened = openEvents.find((e) => e.tag === "STORAGE_OPENED");
+    if (!opened) return available;
+    const handle = { handleId: opened.data.handleId };
+    try {
+      for (const address of addresses) {
+        try {
+          const events = await collectAllEvents("storageGet", {}, {
+            handle,
+            items: [{ id: 0, partition, address, streaming: false, localCache: true }],
+          });
+          const done = events.find((e) => e.tag === "STORAGE_GET_ITEM_COMPLETE");
+          if (done && done.data.errorCode === LoreErrorCode.NONE) available.add(`${address.hash}-${address.context}`);
+        } catch {
+          // Unreadable here — leave it out.
+        }
+      }
+    } finally {
+      await collect("storageClose", {}, { handle }).catch(() => {});
+    }
+  } catch (err) {
+    log.debug("local availability probe failed", { path: rp, message: err instanceof Error ? err.message : String(err) });
+  }
+  return available;
+}
+
 async function pushContent(rp, addresses) {
   if (addresses.length === 0) return [];
 
@@ -1322,7 +1719,10 @@ async function pushContent(rp, addresses) {
 
   try {
     const items = addresses.map((addr, id) => ({ id, partition, address: addr }));
-    const events = await collect("storageUpload", {}, { handle, items });
+    // collectAllEvents, not collect: a bulk verb throws on the first failed item,
+    // which discards the per-item detail and surfaces only "N/N upload items
+    // failed" — useless when the real answer is "this machine doesn't have it".
+    const events = await collectAllEvents("storageUpload", {}, { handle, items });
     const byId = new Map();
     for (const e of events) {
       if (e.tag === "STORAGE_UPLOAD_ITEM_COMPLETE") byId.set(e.data.id, e.data);
@@ -1370,14 +1770,19 @@ async function collectRead(verb, repoPath, args) {
   try {
     return await collect(verb, readArgs(repoPath), args);
   } catch (err) {
-    if (!isAddressNotFound(err)) throw err;
+    // Also matches the native lib's bare "Not found", which is what an offline
+    // read raises when revision *state* (not just content) isn't local yet —
+    // observed on a repo whose branch advanced between our cached anchor and the
+    // local store. Dropping `offline` is exactly what makes the CLI survive it.
+    if (!isMissingLocalContent(err, err instanceof Error ? err.message : String(err))) throw err;
     // Content missing from the local store: retry with remote-first resolution
     // (drop `offline`) so the SDK fetches it. Only paid on a genuine cache miss.
     log.debug("read verb missing content offline; retrying online", { verb, repo: repoPath });
     try {
       return await collect(verb, { repositoryPath: repoPath }, args);
     } catch (retryErr) {
-      if (!isAddressNotFound(retryErr)) throw retryErr;
+      const retryMessage = retryErr instanceof Error ? retryErr.message : String(retryErr);
+      if (!isMissingLocalContent(retryErr, retryMessage)) throw retryErr;
       const actionable = new LoreVerbError(
         "Content isn't available locally yet — sync this repo to view this diff.",
         { verb, status: retryErr.status, code: retryErr.code },
@@ -1423,6 +1828,34 @@ async function pipeEvents(res, events, repoPath, label) {
  */
 async function streamOp(res, verb, globalArgs, args, repoPath) {
   await pipeEvents(res, stream(verb, globalArgs, args), repoPath, verb);
+}
+
+/**
+ * Run repositoryClone and, on success, register the new working copy as a
+ * tracked repo — the whole point of cloning through the app is to use the repo
+ * in it, and before this the clone finished into a folder the app then
+ * ignored (the user had to find and Add it by hand). Mirrors what addRepo
+ * does after an init: track, watch, and tell every client the list changed.
+ * @param {string} dest unix-style destination path (becomes the repo path)
+ * @param {string} url remote repository URL to clone
+ * @returns {AsyncGenerator<import("./errors.mjs").LoreEvt>}
+ */
+async function* cloneAndRegister(dest, url) {
+  for await (const ev of stream("repositoryClone", { repositoryPath: dest }, { repositoryUrl: url })) {
+    if (ev.tag === "DONE" && ev.data?.ok) {
+      const label = dest.split(/[\\/]/).filter(Boolean).pop() || dest;
+      store.addRepo(dest, label);
+      watchRepo(dest, (changed) => {
+        markPendingDirty(dest, changed);
+        notifyChanged(dest, "fs");
+      });
+      // "*" so the repository list cache is invalidated and every client
+      // refetches it — the new repo isn't in any per-repo cache yet.
+      notifyChanged("*", "clone");
+      log.info("clone finished; repository tracked", { dest });
+    }
+    yield ev;
+  }
 }
 
 /** One-shot flag for the startup timing below. */
@@ -1476,15 +1909,35 @@ const server = createServer(async (req, res) => {
       const length = Number(q.get("length") ?? 50);
       const key = cache.repoKey(repoPath || "", `history:${length}`);
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
-      const revisions = await cache.cached(key, cache.TTL.repo, async () => {
-        const events = await collect("revisionHistory", readArgs(repoPath), { length });
-        return xform.history(events);
-      });
+      const revisions = await cache.cached(key, cache.TTL.repo, async () =>
+        // collectRead, not withMaterializeRetry: the failure mode here is missing
+        // revision STATE, not missing file content, so the fix is to drop
+        // `offline` and let the lib resolve it from the remote (what the CLI does
+        // by default and why the CLI survived a case this endpoint failed) —
+        // rather than running a revisionSync, which fetches content and did not
+        // help. Observed as a bare "Not found" while a branch advanced between
+        // our cached anchor and the local store.
+        xform.history(await collectRead("revisionHistory", repoPath, { length }))
+      );
       return sendJson(res, 200, { revisions });
     }
     if (p === "/api/status" && req.method === "GET") {
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
       const key = cache.repoKey(repoPath, "status");
+      // Tell Lore about the paths the watcher saw change before reading, so a
+      // modified file shows up without a full scan. Runs before the cache
+      // lookup because it can change what the read returns.
+      await flushPendingDirty(repoPath);
+      // rescan=1: full working-tree scan, cache bypassed. Kept for the case
+      // where Lore's own view has drifted (paths changed while lore-web wasn't
+      // running, or the watcher missed them), but NOT what the refresh button
+      // uses: scan:true is a write-path verb and it fails outright on a repo
+      // missing a structural blob.
+      if (q.get("rescan") === "1") {
+        const data = await fetchStatusWithRecovery(repoPath, true);
+        cache.put(key, data);
+        return sendJson(res, 200, data);
+      }
       const out = await cache.cached(key, cache.TTL.repo, async () => {
         const data = await fetchStatus(repoPath, false);
         data.scanning = true;
@@ -1561,7 +2014,9 @@ const server = createServer(async (req, res) => {
       if (!rp || !branch) return sendJson(res, 400, { error: "path and branch required" });
       const args = { branch, reset: !!reset };
       if (revision) args.revision = revision;
-      return await streamOp(res, "branchSwitch", { repositoryPath: rp }, args, rp);
+      // Wrapped so a switch that dies partway through realizing files doesn't
+      // leave a half-written tree behind (see switchBranchStream).
+      return await pipeEvents(res, switchBranchStream(rp, args), rp, "branchSwitch");
     }
 
     // Merge operations
@@ -1716,10 +2171,33 @@ const server = createServer(async (req, res) => {
       const results = await pushContent(rp, parsed);
       return sendJson(res, 200, { results });
     }
+    // Can this machine supply these addresses? Asked before offering a repair
+    // action, so the UI never presents a button whose only outcome is failure.
+    if (p === "/api/content-available" && req.method === "POST") {
+      const { path: rp, addresses } = await readBody(req);
+      if (!rp) return sendJson(res, 400, { error: "path required" });
+      if (!Array.isArray(addresses) || addresses.length === 0) {
+        return sendJson(res, 400, { error: "addresses required" });
+      }
+      let parsed;
+      try {
+        parsed = addresses.map(parseAddress);
+      } catch (err) {
+        return sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      const available = await locallyAvailableAddresses(rp, parsed);
+      return sendJson(res, 200, {
+        available: [...available],
+        missing: parsed.map((a) => `${a.hash}-${a.context}`).filter((k) => !available.has(k)),
+      });
+    }
     if (p === "/api/clone" && req.method === "POST") {
       const { url, dest } = await readBody(req);
       if (!url || !dest) return sendJson(res, 400, { error: "url and dest required" });
-      return await streamOp(res, "repositoryClone", { repositoryPath: toUnixPath(dest) }, { repositoryUrl: url }, null);
+      const target = toUnixPath(dest);
+      // repoPath null: the generator below broadcasts "*" itself on success so
+      // the repository LIST refreshes (a per-repo notify wouldn't add it).
+      return await pipeEvents(res, cloneAndRegister(target, normalizeLoopback(url)), null, "repositoryClone");
     }
 
     // Anything else is a static asset request, falling back to the SPA shell.
@@ -1734,7 +2212,12 @@ const server = createServer(async (req, res) => {
 // the user touches anything.
 function startWatchers() {
   for (const r of store.listRepos()) {
-    if (isRepo(r.path)) watchRepo(r.path, () => notifyChanged(r.path, "fs"));
+    if (isRepo(r.path)) {
+      watchRepo(r.path, (changed) => {
+        markPendingDirty(r.path, changed);
+        notifyChanged(r.path, "fs");
+      });
+    }
   }
 }
 

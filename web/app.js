@@ -87,7 +87,54 @@ async function apiStream(path, payload, onEvent) {
   }
 }
 
+/**
+ * Render a failure inside a list panel instead of leaving it blank.
+ *
+ * A panel that fails silently is indistinguishable from one that is empty or
+ * still loading — the reason "revision history never loads" read as nothing
+ * happening rather than as an error. The panel itself has to say so.
+ * @param {string} selector the list element, e.g. "#history-list"
+ * @param {string} what human label, e.g. "history"
+ * @param {Error} err
+ */
+function renderPanelError(selector, what, err) {
+  const ul = $(selector);
+  if (!ul) return;
+  ul.innerHTML = "";
+  const li = document.createElement("li");
+  li.className = "panel-error";
+  li.textContent = `Couldn't load ${what}: ${err.message}`;
+  ul.appendChild(li);
+}
+
+/** Recently shown toast messages → shown-at ms. A background refresh (10s
+ * poll, SSE storm) that keeps failing the same way would otherwise stack an
+ * identical popup on every cycle — e.g. the bare "Not found" a fresh clone's
+ * offline reads raise until its content materializes. */
+const recentToasts = new Map();
+const TOAST_DEDUP_MS = 15_000;
+
 function toast(msg, isErr) {
+  // Drop exact repeats within the window; refresh the timestamp so a
+  // *continuously* failing source stays quiet rather than re-toasting each
+  // time the window lapses mid-storm.
+  const now = Date.now();
+  const last = recentToasts.get(msg);
+  if (last !== undefined && now - last < TOAST_DEDUP_MS) {
+    // Deliberately do NOT refresh the timestamp here. Refreshing it meant a
+    // *continuously* failing background refresh (the 10s poll) suppressed every
+    // repeat forever, so an ongoing failure looked like nothing happening at
+    // all — the panel stayed blank and the user saw one toast, once. Letting the
+    // window lapse re-surfaces a problem that is still happening.
+    return;
+  }
+  recentToasts.set(msg, now);
+  if (recentToasts.size > 50) {
+    for (const [k, t] of recentToasts) {
+      if (now - t >= TOAST_DEDUP_MS) recentToasts.delete(k);
+    }
+  }
+
   const container = $("#toast-container");
 
   const el = document.createElement("div");
@@ -354,9 +401,20 @@ async function loadOrg(path) {
   const pill = $("#repo-org");
   pill.hidden = true;
   try {
-    const { organization, repoName } = await apiGet(`/api/org?path=${encodeURIComponent(path)}`);
-    state.org = { organization, repoName };
-    pill.textContent = organization || "Set organization…";
+    const { organization, repoName, restorableOrganization } = await apiGet(`/api/org?path=${encodeURIComponent(path)}`);
+    state.org = { organization, repoName, restorableOrganization };
+    // Lore keeps the organization only in the working copy's local metadata, so a
+    // re-clone loses it with nothing to read it back from. When the server tells
+    // us we've seen one before for this repo, invite restoring that specific
+    // value instead of a generic "set organization" — otherwise the loss is
+    // silent and the user has to remember what it used to be.
+    if (!organization && restorableOrganization) {
+      pill.textContent = `Restore organization: ${restorableOrganization}`;
+      pill.title = `This repo previously used "${restorableOrganization}". Cloning drops it because Lore stores it only locally. Click to set it again.`;
+    } else {
+      pill.textContent = organization || "Set organization…";
+      pill.title = "Organization — click to change";
+    }
     pill.classList.toggle("org-empty", !organization);
     pill.hidden = false;
   } catch (err) {
@@ -364,15 +422,32 @@ async function loadOrg(path) {
   }
 }
 
-/** Refetch every view for the active repo. The single source of freshness. */
-async function refreshActive() {
+/** Refetch every view for the active repo. The single source of freshness.
+ * `rescan` forces a full server-side working-tree scan (cache bypassed). Off by
+ * default: the server now marks watcher-reported paths dirty before every
+ * status read, so ordinary edits show up without one, and a full scan is a
+ * write-path verb that fails outright on a repo missing a structural blob. */
+async function refreshActive({ rescan = false, surfaceErrors = false } = {}) {
   if (!state.active) return;
   state.refreshSeq++;
   const path = encodeURIComponent(state.active);
-  const statusPromise = loadStatus(path);
+  const statusPromise = loadStatus(path, rescan);
   const historyPromise = loadHistory(path);
   const branchesPromise = statusPromise.then(() => loadBranches(path));
-  await Promise.all([statusPromise, historyPromise, branchesPromise]);
+  const [statusErr, historyErr, branchesErr] = await Promise.all([statusPromise, historyPromise, branchesPromise]);
+  if (!surfaceErrors) return;
+  // Opt-in only: the loaders swallow their own errors (toast + return), so by
+  // default this never rejects — background refreshes (poll, SSE, post-op) and
+  // their callers rely on that. The manual refresh overlay opts in so it can
+  // report failure instead of showing "Success" over broken loads.
+  const failed = [
+    ["status", statusErr],
+    ["history", historyErr],
+    ["branches", branchesErr],
+  ].filter(([, err]) => err);
+  if (failed.length > 0) {
+    throw new Error(failed.map(([what, err]) => `${what}: ${err.message}`).join("; "));
+  }
 }
 
 function fileBadge(f) {
@@ -390,11 +465,11 @@ function fileBadge(f) {
 }
 
 /** Fetches repository status and renders the staged/unstaged file lists. Ignores stale responses when the active repo has changed. */
-async function loadStatus(pathEnc) {
+async function loadStatus(pathEnc, rescan = false) {
   const forPath = state.active;
   const seq = state.refreshSeq;
   try {
-    const data = await apiGet(`/api/status?path=${pathEnc}`);
+    const data = await apiGet(`/api/status?path=${pathEnc}${rescan ? "&rescan=1" : ""}`);
     if (state.active !== forPath || state.refreshSeq !== seq) return;
     $("#repo-branch").textContent = data.branch || "";
 
@@ -418,6 +493,11 @@ async function loadStatus(pathEnc) {
     updateChangesBar(data);
   } catch (err) {
     toast(err.message, true);
+    renderPanelError("#unstaged-files", "changes", err);
+    $("#staged-files").innerHTML = "";
+    // Returned (not rethrown) so refreshActive can surface failures when asked
+    // without breaking the many callers that expect these loaders never to throw.
+    return err;
   }
 }
 
@@ -938,6 +1018,8 @@ async function loadHistory(pathEnc) {
     }
   } catch (err) {
     toast(err.message, true);
+    renderPanelError("#history-list", "history", err);
+    return err; // see loadStatus — lets refreshActive surface failures on demand
   }
 }
 
@@ -1099,6 +1181,8 @@ async function loadBranches(pathEnc) {
     }
   } catch (err) {
     toast(err.message, true);
+    renderPanelError("#branch-list", "branches", err);
+    return err; // see loadStatus — lets refreshActive surface failures on demand
   }
 }
 
@@ -1468,31 +1552,64 @@ async function runOp(title, path, payload, opts = {}) {
   }
 
   // A commit whose content upload timed out publishes a revision other clients
-  // can't sync — the remote never received that blob. The content is usually
-  // still recoverable from whichever machine committed it, so offer to push it
-  // straight from here rather than leaving the user with just an address in an
-  // error string.
+  // can't sync — the remote never received that blob. When the bytes are still
+  // on THIS machine we can push them straight from here. When they aren't,
+  // offering that button is worse than offering nothing: it can only fail, and
+  // the underlying verb reports it as an opaque "N/N upload items failed". So
+  // ask the server what this machine can actually supply first.
   const missing = failureMessage ? findMissingAddresses(failureMessage) : [];
   if (missing.length > 0) {
-    pushContentBtn.hidden = false;
-    pushContentBtn.textContent = `Push missing content (${missing.length})`;
-    pushContentBtn.onclick = async () => {
-      pushContentBtn.disabled = true;
-      try {
-        const { results } = await apiPost("/api/push-content", { path: state.active, addresses: missing });
-        const failed = results.filter((r) => r.errorCode !== 0);
-        if (failed.length === 0) {
-          toast("Pushed missing content — retry the sync now.");
-          pushContentBtn.hidden = true;
-        } else {
-          toast(`This machine doesn't have all of the missing content (${failed.length} still missing).`, true);
+    const affectedFile = failureMessage.match(/Failed to sync file (.+?)(?:\r?\n|$)/)?.[1]?.trim();
+    let suppliable = missing;
+    try {
+      const { available } = await apiPost("/api/content-available", { path: state.active, addresses: missing });
+      suppliable = missing.filter((a) => available.includes(a));
+    } catch {
+      // Probe failed — fall back to offering the button rather than hiding a
+      // repair that might have worked.
+    }
+
+    if (suppliable.length === 0) {
+      appendOpLog(
+        logEl,
+        `\nThis content is missing from the server AND from this machine, so there is nothing to push from here.\n` +
+          (affectedFile ? `Affected file: ${affectedFile}\n` : "") +
+          `Address${missing.length === 1 ? "" : "es"}: ${missing.join(", ")}\n` +
+          `It has to be re-uploaded from a machine that still holds the file — normally the one that committed it.\n`
+      );
+    } else {
+      pushContentBtn.hidden = false;
+      pushContentBtn.textContent = `Push missing content (${suppliable.length})`;
+      pushContentBtn.onclick = async () => {
+        pushContentBtn.disabled = true;
+        try {
+          const { results } = await apiPost("/api/push-content", { path: state.active, addresses: suppliable });
+          const failed = results.filter((r) => r.errorCode !== 0);
+          const unsuppliable = missing.length - suppliable.length;
+          if (failed.length === 0 && unsuppliable === 0) {
+            pushContentBtn.hidden = true;
+            // A branch switch that failed only on missing content can now
+            // succeed — re-run it instead of making the user find the branch
+            // and click switch again.
+            if (path === "/api/branch/switch") {
+              toast("Pushed missing content — retrying the branch switch…");
+              await runOp(title, path, payload, opts);
+              return;
+            }
+            toast("Pushed missing content — retry the sync now.");
+          } else if (failed.length === 0) {
+            toast(`Pushed ${suppliable.length}, but ${unsuppliable} address(es) aren't on this machine either.`, true);
+          } else {
+            appendOpLog(logEl, `\n${failed.length} upload(s) failed:\n${failed.map((r) => `  ${r.hash}-${r.context} (error ${r.errorCode})`).join("\n")}\n`);
+            toast(`${failed.length} of ${suppliable.length} uploads failed — see the log.`, true);
+          }
+        } catch (err) {
+          toast(err.message, true);
+        } finally {
+          pushContentBtn.disabled = false;
         }
-      } catch (err) {
-        toast(err.message, true);
-      } finally {
-        pushContentBtn.disabled = false;
-      }
-    };
+      };
+    }
   }
 
   // Keep the overlay blocking until every view reflects the new repo state —
@@ -1643,6 +1760,10 @@ function connectSSE() {
       if (msg.repo === "*") scheduleRefresh({ repos: true });
       else if (msg.repo === state.active) scheduleRefresh({ repos: true, active: true });
       else scheduleRefresh({ repos: true });
+    } else if (msg.type === "notice") {
+      // Background failures the server wants the user to see (e.g. a full
+      // status scan failing while a cached incomplete file list keeps showing).
+      if (msg.repo === "*" || msg.repo === state.active) toast(msg.message, msg.level === "warn");
     }
   };
 }
@@ -1950,7 +2071,12 @@ async function saveConfig() {
 
 function wire() {
   $("#add-btn").onclick = addRepo;
-  $("#refresh-btn").onclick = refreshActive;
+  // Manual refresh runs behind the blocking overlay so it's visible that a
+  // refresh is happening and whether it worked; failures keep the overlay open
+  // with the aggregate message. The rethrow is swallowed here because the
+  // loaders already toasted the specifics and the overlay is the primary
+  // surface for this action.
+  $("#refresh-btn").onclick = () => runBlocking("Refreshing…", () => refreshActive({ surfaceErrors: true })).catch(() => {});
   $("#commit-btn").onclick = commit;
   $("#stage-all-btn").onclick = stageAll;
   $("#unstage-all-btn").onclick = unstageAll;
@@ -2014,6 +2140,11 @@ function wire() {
     setTimeout(async () => {
       await runOp("Cloning…", "/api/clone", { url, dest });
       await loadRepos();
+      // The server tracks the repo on clone success, so it's in the refreshed
+      // list now — open it directly instead of making the user find the row.
+      // On failure it's absent and this is a no-op.
+      const target = dest.replace(/\\/g, "/");
+      if (state.repos?.some((r) => r.path === target)) await selectRepo(target);
     }, 0);
   };
 
@@ -2022,7 +2153,9 @@ function wire() {
     $("#org-repo").textContent = state.org?.repoName
       ? `Repository: ${state.org.repoName}`
       : "";
-    $("#org-name").value = state.org?.organization || "";
+    // Prefill the remembered organization when the current one is blank (a
+    // re-clone drops it), so restoring is one click rather than recall.
+    $("#org-name").value = state.org?.organization || state.org?.restorableOrganization || "";
     $("#org-dialog").showModal();
     $("#org-name").focus();
   };

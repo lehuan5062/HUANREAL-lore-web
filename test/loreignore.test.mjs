@@ -82,8 +82,8 @@ test("setup tolerates trailing-slash variants already present", () => {
 test("appendIgnorePattern adds a pattern once and reports duplicates", () => {
   const dir = freshRepo();
   try {
-    assert.equal(appendIgnorePattern(dir, "*.tmp"), true);
-    assert.equal(appendIgnorePattern(dir, "*.tmp"), false);
+    assert.deepEqual(appendIgnorePattern(dir, "*.tmp"), { added: true, blocked: false });
+    assert.deepEqual(appendIgnorePattern(dir, "*.tmp"), { added: false, blocked: false });
     const lore = readFileSync(join(dir, ".loreignore"), "utf8");
     assert.equal(lore.match(/^\*\.tmp$/gm).length, 1);
   } finally {

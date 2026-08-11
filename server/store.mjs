@@ -55,6 +55,51 @@ export function getRepo(path) {
 }
 
 /**
+ * Remember a repository's organization so it can be restored after a re-clone.
+ *
+ * Lore keeps the organization only as an `org/repo` prefix on the working copy's
+ * LOCAL `name` metadata — the server does not store it (measured: a repo whose
+ * local name is `HUANREAL/InfinityGarden_Master` is registered on the server as
+ * plain `InfinityGarden_Master`). So a clone, or anything that rebuilds `.lore`,
+ * silently drops it and there is nowhere to read it back from. This store is the
+ * only place it can survive, which is why it is kept here rather than derived.
+ *
+ * Keyed by repository id as well as path when known, because a re-clone usually
+ * lands on a different folder while keeping the same id.
+ * @param {string} path absolute working-copy path
+ * @param {string} organization the organization, or "" to forget it
+ * @param {string} [repositoryId] lore repository id, if resolved
+ */
+export function rememberOrganization(path, organization, repositoryId) {
+  const entry = getRepo(path);
+  if (!entry) return;
+  if (organization) {
+    entry.organization = organization;
+    if (repositoryId) entry.repositoryId = repositoryId;
+  } else {
+    delete entry.organization;
+  }
+  persist();
+}
+
+/**
+ * The organization last seen for this repo — by path, else by repository id (so a
+ * re-clone into a new folder still finds it).
+ * @param {string} path
+ * @param {string} [repositoryId]
+ * @returns {string} the remembered organization, or "" if none
+ */
+export function rememberedOrganization(path, repositoryId) {
+  const byPath = getRepo(path);
+  if (byPath?.organization) return byPath.organization;
+  if (repositoryId) {
+    const byId = state.repos.find((r) => r.repositoryId === repositoryId && r.organization);
+    if (byId?.organization) return byId.organization;
+  }
+  return "";
+}
+
+/**
  * Add (or relabel) a tracked repository.
  * @param {string} path absolute working-copy path
  * @param {string} label display name

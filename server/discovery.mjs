@@ -13,7 +13,7 @@ import { log } from "./log.mjs";
  * @param {number} timeout milliseconds to wait before considering unreachable
  * @returns {Promise<boolean>} true if server responds, false otherwise
  */
-function testServer(host, port, timeout = 1000) {
+export function testServer(host, port, timeout = 1000) {
   return new Promise((resolve) => {
     const socket = createConnection({ host, port, timeout });
     const timer = setTimeout(() => {

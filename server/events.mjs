@@ -41,3 +41,16 @@ export function broadcastRefresh(repoPath, reason = "change") {
   const payload = JSON.stringify({ type: "refresh", repo: repoPath, reason });
   for (const res of clients) res.write(`data: ${payload}\n\n`);
 }
+
+/**
+ * Broadcast a user-facing notice (shown as a toast) to every connected browser.
+ * Used for background failures that would otherwise be invisible — e.g. a full
+ * status scan failing after the fast result already rendered.
+ * @param {string} repoPath the repo the notice concerns (or "*")
+ * @param {"info"|"warn"} level
+ * @param {string} message
+ */
+export function broadcastNotice(repoPath, level, message) {
+  const payload = JSON.stringify({ type: "notice", repo: repoPath, level, message });
+  for (const res of clients) res.write(`data: ${payload}\n\n`);
+}

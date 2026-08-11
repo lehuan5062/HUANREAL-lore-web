@@ -353,6 +353,13 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
   pointer-events: none;
 }
 #repo-view.loading { opacity: 0.8; }
+/* A panel that failed to load says so in place. Without this a failed load is
+   indistinguishable from an empty or still-loading panel. */
+.panel-error {
+  padding: 8px 10px; color: var(--red);
+  font-size: 0.9em; line-height: 1.35; white-space: normal; cursor: default;
+}
+.panel-error:hover { background: transparent; }
 .repo-list li.skeleton { cursor: default; }
 .repo-list li.skeleton:hover { background: transparent; }
 .r-branch-skel { width: 44px; height: 0.9em; margin: 0 0 0 auto; display: inline-block; }
