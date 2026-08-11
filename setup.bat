@@ -40,17 +40,21 @@ if errorlevel 1 (
   exit /b 1
 )
 
-REM --- lore CLI (needed to log in to a server) ---
+REM --- lore CLI (login, plus every feature that talks to a remote server) ---
 where lore >nul 2>nul
 if errorlevel 1 goto :no_lore
 goto :done
 
 :no_lore
-echo [lore-web] The 'lore' CLI was not found.
+echo [lore-web] The 'lore' CLI was not found. lore-web needs it to log in, to
+echo            browse or delete repositories on the server, and to mark which
+echo            branches are local-only vs remote-only. Local work still works
+echo            without it, but those branch badges vanish with no error shown.
 choice /C YN /M "[lore-web] Install it now via the official Lore installer"
 if errorlevel 2 (
-  echo            Install it later from:
+  echo            Skipped. Install it later from:
   echo              https://epicgames.github.io/lore/how-to/install-lore-cli/
+  echo            then re-run this script.
   goto :done
 )
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.ps1 | iex"

@@ -1004,6 +1004,21 @@ async function fetchStatus(repoPath, scan) {
  * read needs" — either a typed/text address-not-found, or the native lib's
  * bare "Not found" (lore-base error.rs), which is what offline reads raise
  * against a lazily-populated fresh clone whose state isn't materialized yet. */
+/**
+ * True when a CLI call failed because the `lore` binary could not be run at all,
+ * rather than because the command itself failed.
+ *
+ * Distinguishing these matters: a real command failure (remote down, timeout,
+ * unauthorized) is expected background noise, while "there is no CLI here" is a
+ * setup problem the user has to be told about. `runCli` resolves a spawn error
+ * as `code: -1` with the OS message, so the signal is the ENOENT text — not the
+ * timeout text, which is a working CLI that took too long.
+ * @param {string} message
+ */
+function isCliUnavailable(message) {
+  return /ENOENT|not recognized|no such file|cannot find/i.test(String(message ?? ""));
+}
+
 function isMissingLocalContent(err, message) {
   return isAddressNotFound(err) || isAddressNotFoundMessage(message) || /^not found$/i.test(String(message ?? "").trim());
 }
@@ -1244,10 +1259,27 @@ function refreshOnlineBranches(repoPath, archived) {
       }
     })
     .catch((err) => {
-      log.debug("online branch enrichment failed", { key, message: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      log.debug("online branch enrichment failed", { key, message });
       const failCount = (onlineBranchBackoff.get(key)?.failCount ?? 0) + 1;
       const delay = Math.min(ONLINE_BRANCH_TTL_MS * 2 ** (failCount - 1), ONLINE_BRANCH_BACKOFF_MAX_MS);
       onlineBranchBackoff.set(key, { failCount, nextAttemptAt: Date.now() + delay });
+      // Every other failure here is expected and self-explanatory (remote down,
+      // slow, unauthorized) and is deliberately quiet — this runs in the
+      // background on a timer. A MISSING CLI is different: nothing else in the UI
+      // reports it, the branch list still renders from the offline path, and the
+      // only visible effect is that the local-only/remote-only badges silently
+      // stop appearing. That is undiagnosable without being told, so say it once
+      // (failCount === 1; the backoff keeps it from repeating, and a later
+      // success clears the count so a genuine recurrence can speak up again).
+      if (failCount === 1 && isCliUnavailable(message)) {
+        log.warn("lore CLI not available; remote branch enrichment disabled", { key, message });
+        broadcastNotice(
+          repoPath,
+          "warn",
+          "The `lore` CLI wasn't found, so branches can't be compared against the server — the local-only/remote-only badges are unavailable. Install the CLI (or set LORE_CLI to its path) and reload."
+        );
+      }
     })
     .finally(() => onlineBranchInflight.delete(key));
 }

@@ -61,10 +61,26 @@ npm start         # launch the server and open http://127.0.0.1:7420
 
 Then click **Add**, paste the path to a Lore working copy, and you're in.
 
-> **Sharing with a collaborator:** this entire repository is self-contained. They
-> can clone it, then run `setup.bat` (or `npm install`) once, followed by
-> `lore login lore://<your-host>:41337`. See the
-> [how-to guide](docs/how-to/run-lore-web.md).
+### Setting up a collaborator machine
+
+This repository is self-contained — a collaborator clones it and works through
+these four steps once. Steps 3 and 4 happen in the app, and skipping step 3 is
+what leaves a fresh install pointed at no server at all.
+
+1. Run **`setup.bat`** (or `npm install`) — installs Node.js if needed, the SDK,
+   and the `lore` CLI.
+2. `lore login lore://<your-host>:41337` — authenticate against the host's server.
+3. Start the app, click **⚙** beside the logo, and set the **remote server URL**
+   to the same `lore://<your-host>:41337`.
+4. Click **Add** and paste the path to a working copy — or **Clone from URL…** to
+   fetch one from the server.
+
+> **Updating an existing install:** run **`setup.bat`**, not `start.bat`.
+> `start.bat` skips setup whenever `node_modules/@lore-vcs/sdk` already exists,
+> so an old SDK survives the update silently. See
+> [Versions](#versions).
+
+See the [how-to guide](docs/how-to/run-lore-web.md) for the longer walkthrough.
 
 - Run headless (no browser auto-open): `npm run serve`
 - Run the tests: `npm test`
@@ -93,15 +109,50 @@ through the app; once configured, the app's own setting takes over.
 > is bound to loopback only. Never expose it on a network. The *Lore server* is
 > the networked component, not lore-web.
 
-## The SDK dependency
+## Runtime dependencies
 
-lore-web does not depend on any other Lore client. Its one runtime dependency is
-[`@lore-vcs/sdk`](https://www.npmjs.com/package/@lore-vcs/sdk) from the public npm
-registry; `npm install` also pulls the platform-specific native library
+lore-web needs **two** Lore clients, and they are upgraded separately.
+
+**1. `@lore-vcs/sdk`** (required) — the primary engine, from the public npm
+registry. `npm install` also pulls the platform-specific native library
 (`lorelib`) and `koffi` automatically. No binaries are committed to the repo.
 
-Keep the SDK **version-matched to the Lore server** you talk to (currently
-`0.8.4`). To upgrade, bump the version in `package.json` and re-run `npm install`.
+**2. The `lore` CLI on `PATH`** (strongly recommended) — a few operations run as
+a subprocess instead of in-process. Set `LORE_CLI` to an absolute path if the
+binary is not on `PATH`. It is used for:
+
+| Feature | Without the CLI |
+|---|---|
+| Login status / `lore login` | The app cannot tell whether you are authenticated |
+| Deleting a repository on the server | That action fails |
+| **Local-only / remote-only branch badges** | **Degrades silently** — branches still list from local data, the badges just stop appearing |
+| **"Server repositories…" browser** | Shows an error when opened |
+
+The last two moved to the CLI deliberately: the SDK cannot cancel an in-flight
+call, so a call that hangs against an unreachable server permanently occupies a
+threadpool worker, while a hung subprocess can simply be killed. `lore --json`
+emits the same events the SDK does. See `LORE_BUG_PROMPTS.md` (P5 BUG 1) for the
+upstream bug, and run `node scripts/check-lore-updates.mjs` to see when it is
+fixed and these shims can be reverted.
+
+### Versions
+
+The SDK, the `lore` CLI, and `loreserver` are **three separate upgrades** —
+bumping one does not touch the others, and mixing versions has bitten us before.
+Current baseline: SDK `0.8.6`, CLI `0.8.6`, server `0.8.6`.
+
+- SDK: bump the version in `package.json`, then `npm install`.
+- CLI and server: install from the
+  [Lore releases](https://github.com/EpicGames/lore/releases).
+
+Keep the SDK at least version-matched to the server you talk to. Older clients
+lack the transport connect timeouts, which turns an unreachable remote into a
+~30 s stall on every call rather than a prompt failure.
+
+> **Updating an existing install:** run **`setup.bat`**, not `start.bat`.
+> `start.bat` only runs setup when `node_modules/@lore-vcs/sdk` is *absent*, so
+> an existing install keeps whatever SDK version it already had — silently.
+> `setup.bat` always runs `npm install`.
 
 ## Documentation
 
