@@ -41,16 +41,31 @@ if errorlevel 1 (
 )
 
 REM --- lore CLI (login, plus every feature that talks to a remote server) ---
+REM Required version comes from package.json's @lore-vcs/sdk pin -- CLI and SDK
+REM ship in lockstep upstream, so that's the single source of truth for both.
 where lore >nul 2>nul
 if errorlevel 1 goto :no_lore
-goto :done
+
+REM Found -- but presence isn't enough, it might be stale. `lore --version`
+REM prints like "lore 0.8.6+373"; take the 2nd token and hand both versions to
+REM node for a numeric major.minor.patch compare (batch can't do this reliably:
+REM plain string compare would treat "0.9.0" < "0.8.6" as false alphabetically,
+REM which is wrong once double-digit parts show up, e.g. "0.10.0" vs "0.9.0").
+for /f "tokens=2" %%V in ('lore --version') do set INSTALLED_LORE_VERSION=%%V
+node -e "const req=require('./package.json').dependencies['@lore-vcs/sdk'].replace(/^\D*/,'');const cur=process.argv[1].split('+')[0];const p=s=>s.split('.').map(Number);const [a,b]=[p(cur),p(req)];for(let i=0;i<3;i++){if(a[i]>b[i])process.exit(0);if(a[i]<b[i])process.exit(1);}process.exit(0);" "%INSTALLED_LORE_VERSION%"
+if not errorlevel 1 goto :done
+for /f "delims=" %%V in ('node -e "console.log(require('./package.json').dependencies['@lore-vcs/sdk'].replace(/^\D*/,''))"') do set REQUIRED_LORE_VERSION=%%V
+echo [lore-web] The 'lore' CLI is version %INSTALLED_LORE_VERSION%, but this app needs at least %REQUIRED_LORE_VERSION%.
+goto :install_lore
 
 :no_lore
 echo [lore-web] The 'lore' CLI was not found. lore-web needs it to log in, to
 echo            browse or delete repositories on the server, and to mark which
 echo            branches are local-only vs remote-only. Local work still works
 echo            without it, but those branch badges vanish with no error shown.
-choice /C YN /M "[lore-web] Install it now via the official Lore installer"
+
+:install_lore
+choice /C YN /M "[lore-web] Install/upgrade it now via the official Lore installer"
 if errorlevel 2 (
   echo            Skipped. Install it later from:
   echo              https://epicgames.github.io/lore/how-to/install-lore-cli/
