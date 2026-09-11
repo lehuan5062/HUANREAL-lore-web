@@ -464,6 +464,27 @@ function fileBadge(f) {
   return ["M", "badge-M"];
 }
 
+/**
+ * Flag the branch pill when the local latest pointer trails the remote. Best
+ * effort: a failure here means the remote could not be reached, which is not
+ * worth a toast on a background check the user never asked for.
+ */
+async function checkBehindRemote(pathEnc, branch, forPath, seq) {
+  try {
+    const { info } = await apiGet(`/api/branch-info?path=${pathEnc}&branch=${encodeURIComponent(branch)}`);
+    if (state.active !== forPath || state.refreshSeq !== seq) return;
+    if (!info?.behindRemote) return;
+    const pill = $("#repo-branch");
+    pill.classList.add("behind");
+    pill.textContent = `${branch} — behind remote`;
+    pill.title =
+      `Local latest:  ${info.latest}\nRemote latest: ${info.latestRemote}\n\n` +
+      `Sync, then re-stage before committing. A commit will be refused until the local pointer catches up.`;
+  } catch {
+    // Remote unreachable -- leave the pill as-is.
+  }
+}
+
 /** Fetches repository status and renders the staged/unstaged file lists. Ignores stale responses when the active repo has changed. */
 async function loadStatus(pathEnc, rescan = false) {
   const forPath = state.active;
@@ -472,9 +493,18 @@ async function loadStatus(pathEnc, rescan = false) {
     const data = await apiGet(`/api/status?path=${pathEnc}${rescan ? "&rescan=1" : ""}`);
     if (state.active !== forPath || state.refreshSeq !== seq) return;
     $("#repo-branch").textContent = data.branch || "";
+    $("#repo-branch").classList.remove("behind");
+    $("#repo-branch").title = "";
 
     // Store status for use in graph rendering and popover
     state.status = data;
+
+    // Status is a local-only read, so it cannot tell the user their branch
+    // pointer trails the remote -- the state that makes a commit fail with
+    // "Branch has been advanced by another instance" while a sync reports
+    // there is nothing to do. Fetched separately and never awaited on the
+    // render path: a slow or unreachable remote must not stall the file lists.
+    if (data.branch) checkBehindRemote(pathEnc, data.branch, forPath, seq);
 
     // Render merge UI if in merge
     renderMergeUI(data);
@@ -974,8 +1004,11 @@ async function commit() {
   if (!msg) return toast("Enter a commit message", true);
   $("#commit-btn").disabled = true;
   try {
-    await runOp("Committing…", "/api/commit", { path: state.active, message: msg });
-    $("#commit-msg").value = "";
+    // Only clear on success -- a failed commit that wiped the box would destroy
+    // a message the user has to retype before they can retry.
+    if (await runOp("Committing…", "/api/commit", { path: state.active, message: msg })) {
+      $("#commit-msg").value = "";
+    }
   } finally {
     $("#commit-btn").disabled = false;
   }
@@ -1406,6 +1439,9 @@ function findMissingAddresses(message) {
   return [...seen];
 }
 
+/** Matches the native SDK's commit rejection when the branch head moved underneath us. */
+const BRANCH_ADVANCED_RE = /Branch has been advanced by another instance/i;
+
 /**
  * Run a one-shot action behind the blocking overlay. The sibling of runOp for
  * endpoints that answer with a single JSON response rather than a stream:
@@ -1557,6 +1593,21 @@ async function runOp(title, path, payload, opts = {}) {
   // offering that button is worse than offering nothing: it can only fail, and
   // the underlying verb reports it as an opaque "N/N upload items failed". So
   // ask the server what this machine can actually supply first.
+  // The error text says "sync and re-stage", but a sync alone can report
+  // "already on <rev>" and change nothing: the working copy tracks one revision
+  // while the branch's local latest pointer tracks another, and sync only
+  // reconciles the former. Commit reads the pointer, so it keeps refusing.
+  // `lore branch info` is the only view that shows the two apart.
+  if (failureMessage && BRANCH_ADVANCED_RE.test(failureMessage)) {
+    appendOpLog(
+      logEl,
+      `\nThe branch moved on the remote since these changes were staged.\n` +
+        `Sync, then re-stage, then commit again — staging is anchored to the old revision and does not survive the move.\n` +
+        `If the sync reports "already on" and the commit still fails, the local branch pointer is behind rather than the files:\n` +
+        `check "lore branch info <branch>" and compare Latest against Remote Latest.\n`
+    );
+  }
+
   const missing = failureMessage ? findMissingAddresses(failureMessage) : [];
   if (missing.length > 0) {
     const affectedFile = failureMessage.match(/Failed to sync file (.+?)(?:\r?\n|$)/)?.[1]?.trim();
@@ -1624,6 +1675,7 @@ async function runOp(title, path, payload, opts = {}) {
   } else {
     closeBtn.hidden = false;
   }
+  return !failureMessage;
 }
 
 async function syncToRevision(revision) {

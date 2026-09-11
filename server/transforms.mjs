@@ -74,6 +74,30 @@ export function status(events) {
 }
 
 /**
+ * A branch's own view of where it is, from `branchInfo`. `behindRemote` is the
+ * signal the status UI lacks otherwise: the working copy can already sit on the
+ * remote revision while the branch's local latest pointer trails it, and only
+ * this pair shows the two apart (commit reads the pointer, sync reconciles the
+ * files, so a sync can succeed and leave a commit still refusing).
+ * @param {LoreEvt[]} events
+ */
+export function branchInfo(events) {
+  const b = events.find((e) => e.tag === "BRANCH_INFO")?.data;
+  if (!b) return null;
+  const isZeroHash = (h) => !h || /^0+$/.test(h);
+  const { latest, latestRemote } = b;
+  return {
+    id: b.id,
+    name: b.name,
+    latest,
+    latestRemote,
+    // Only meaningful once both sides are known; an unpushed branch has no
+    // remote latest and is not "behind" anything.
+    behindRemote: !isZeroHash(latest) && !isZeroHash(latestRemote) && latest !== latestRemote,
+  };
+}
+
+/**
  * Transform branch list events into full stable shape with id, location,
  * category, creator, created, isCurrent, archived, stack, and latest revision.
  * @param {LoreEvt[]} events

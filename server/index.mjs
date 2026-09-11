@@ -1978,6 +1978,21 @@ const server = createServer(async (req, res) => {
       if (out.scanning) startBackgroundScan(repoPath, key);
       return sendJson(res, 200, out);
     }
+    // Local vs remote latest for one branch. Separate from /api/status because
+    // status is a purely local read and carries no remote pointer at all --
+    // which is why a branch trailing the remote was only ever discoverable by
+    // failing a commit.
+    if (p === "/api/branch-info" && req.method === "GET") {
+      if (!repoPath) return sendJson(res, 400, { error: "path required" });
+      const branch = q.get("branch");
+      if (!branch) return sendJson(res, 400, { error: "branch required" });
+      // Deliberately NOT collectRead: that pins `offline: true`, under which the
+      // SDK returns an all-zero latestRemote and the comparison can never fire.
+      // The whole point of this endpoint is the remote pointer, so it has to go
+      // online -- the client calls it off the render path for that reason.
+      const events = await collect("branchInfo", { repositoryPath: repoPath }, { branch });
+      return sendJson(res, 200, { info: xform.branchInfo(events) });
+    }
     if (p === "/api/branches" && req.method === "GET") {
       if (!repoPath) return sendJson(res, 400, { error: "path required" });
       const archived = q.get("archived") === "true";

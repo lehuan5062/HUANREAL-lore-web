@@ -109,6 +109,29 @@ test("branches returns full stable shape", () => {
   assert.equal(result[0].archived, false);
 });
 
+test("branchInfo flags behindRemote when the local latest trails the remote", () => {
+  const events = [ev("BRANCH_INFO", { id: "b1", name: "main", latest: "aaa111", latestRemote: "bbb222" })];
+  const info = xform.branchInfo(events);
+  assert.equal(info.latest, "aaa111");
+  assert.equal(info.latestRemote, "bbb222");
+  assert.equal(info.behindRemote, true);
+});
+
+test("branchInfo reports in-sync when local and remote latest match", () => {
+  const events = [ev("BRANCH_INFO", { id: "b1", name: "main", latest: "aaa111", latestRemote: "aaa111" })];
+  assert.equal(xform.branchInfo(events).behindRemote, false);
+});
+
+test("branchInfo does not call an unpushed branch behind (zero-hash remote)", () => {
+  const zero = "0".repeat(64);
+  const events = [ev("BRANCH_INFO", { id: "b1", name: "feature", latest: "aaa111", latestRemote: zero })];
+  assert.equal(xform.branchInfo(events).behindRemote, false);
+});
+
+test("branchInfo returns null when no BRANCH_INFO event is present", () => {
+  assert.equal(xform.branchInfo([ev("COMPLETE", { status: 0 })]), null);
+});
+
 test("status includes merge-related fields", () => {
   const events = [
     ev("REPOSITORY_STATUS_REVISION", {
