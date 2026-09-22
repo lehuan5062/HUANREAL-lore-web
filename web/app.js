@@ -1621,14 +1621,56 @@ async function runOp(title, path, payload, opts = {}) {
     }
 
     if (suppliable.length === 0) {
+      // "Get it from the machine that has it" is only half the advice, and is
+      // actively misleading when no machine has it — it sends the user hunting
+      // for a machine that does not exist. The rest of this text is the part
+      // that costs hours to rediscover: the content must change so it hashes
+      // differently, and re-committing identical bytes can never work because
+      // fragments are addressed by content hash. Keep in step with
+      // unrecoverableContentMessage() in server/index.mjs, which says the same
+      // thing for the Force Push path (and can also name the Unreal assets,
+      // which the browser cannot detect on its own).
       appendOpLog(
         logEl,
         `\nThis content is missing from the server AND from this machine, so there is nothing to push from here.\n` +
           (affectedFile ? `Affected file: ${affectedFile}\n` : "") +
           `Address${missing.length === 1 ? "" : "es"}: ${missing.join(", ")}\n` +
-          `It has to be re-uploaded from a machine that still holds the file — normally the one that committed it.\n`
+          `\nTwo ways forward:\n` +
+          `1. Push from a machine that still holds it — normally the one that committed it.\n` +
+          `2. If no machine has it, the content itself has to change so it hashes differently.\n` +
+          `   Re-committing the same bytes will NOT work: fragments are addressed by content\n` +
+          `   hash, so identical content reproduces this same dead address every time.\n` +
+          `   For Unreal assets, a resave is enough to produce fresh bytes.\n`
       );
-    } else {
+    }
+
+    if (path === "/api/push") {
+      // Push has its own single-click repair-and-retry on the server
+      // (pushWithRepairStream, driven by `force: true`) instead of the
+      // generic push-content-then-manually-retry dance below — one button,
+      // one round trip.
+      //
+      // Offered even when the probe says nothing is suppliable. That probe is
+      // a real read, but a store that has lost track of a payload it still
+      // holds is precisely the failure that lands users here, so a probe
+      // saying "not here" is not proof enough to withhold the retry. The
+      // label says which case the user is in so the button never implies a
+      // fix it cannot deliver.
+      pushContentBtn.hidden = false;
+      pushContentBtn.textContent =
+        suppliable.length > 0
+          ? `Force Push (repair ${suppliable.length} address${suppliable.length === 1 ? "" : "es"})`
+          : "Force Push (content not on this machine)";
+      pushContentBtn.onclick = async () => {
+        pushContentBtn.disabled = true;
+        pushContentBtn.hidden = true;
+        try {
+          await runOp(title, path, { ...payload, force: true }, opts);
+        } finally {
+          pushContentBtn.disabled = false;
+        }
+      };
+    } else if (suppliable.length > 0) {
       pushContentBtn.hidden = false;
       pushContentBtn.textContent = `Push missing content (${suppliable.length})`;
       pushContentBtn.onclick = async () => {

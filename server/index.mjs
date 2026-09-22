@@ -5,7 +5,7 @@
 
 import { createServer } from "node:http";
 import { readFile, stat, readdir } from "node:fs/promises";
-import { existsSync, readFileSync, rmSync, renameSync, mkdtempSync, writeFileSync, accessSync, constants as fsConstants } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, renameSync, mkdtempSync, writeFileSync, accessSync, constants as fsConstants } from "node:fs";
 import { join, extname, normalize as normalizePath, dirname, parse as parsePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
@@ -28,7 +28,7 @@ import { isLoggedIn, runCli, runCliJson } from "./cli.mjs";
 import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore, hasP4ignore } from "./loreignore.mjs";
 import { discoverServers, testServer } from "./discovery.mjs";
 import * as cache from "./cache.mjs";
-import { parseAddress } from "./address.mjs";
+import { parseAddress, extractAddressNotFoundAddresses } from "./address.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(HERE, "..", "web");
@@ -1784,6 +1784,167 @@ async function pushContent(rp, addresses) {
   }
 }
 
+/** Unreal asset extensions — the files a resave can cheaply give fresh bytes to. */
+const UNREAL_ASSET_RE = /\.(umap|uasset)$/i;
+const UPROJECT_RE = /\.uproject$/i;
+
+/** The repo's `.uproject` file name, or null when this isn't an Unreal project. */
+function unrealProjectFile(rp) {
+  try {
+    return readdirSync(rp).find((f) => UPROJECT_RE.test(f)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Unreal assets changed in the revision(s) this push could not deliver — the
+ * shortlist of files a resave should target. Best-effort: any failure yields an
+ * empty list, because this only enriches an error message and must never
+ * replace one failure with another.
+ * @param {string} rp repository path
+ * @returns {Promise<string[]>} repo-relative asset paths
+ */
+async function unpushedUnrealAssets(rp) {
+  try {
+    // Deliberately NOT readArgs(): `offline: true` skips remote resolution, and
+    // then revisionRemote comes back as the zero hash (measured), which would
+    // make this silently return nothing every time. Reaching the server is safe
+    // here — this only runs after a push already round-tripped to it.
+    const statusEvents = await collect("repositoryStatus", { repositoryPath: rp }, { staged: false });
+    const remoteRevision = statusEvents.find((e) => e.tag === "REPOSITORY_STATUS_REVISION")?.data?.revisionRemote;
+    if (!remoteRevision || /^0+$/.test(remoteRevision)) return [];
+    // The diff itself is local-only, so offline is both correct and faster.
+    const diffEvents = await collect("revisionDiff", readArgs(rp), { revisionSource: remoteRevision });
+    return xform
+      .diff(diffEvents)
+      .map((d) => d?.path)
+      .filter((p) => typeof p === "string" && UNREAL_ASSET_RE.test(p));
+  } catch (err) {
+    log.debug("could not list unpushed Unreal assets", { repo: rp, message: err instanceof Error ? err.message : String(err) });
+    return [];
+  }
+}
+
+/**
+ * What to tell a user whose push is blocked by content that exists nowhere —
+ * not on the server, not on this machine.
+ *
+ * The obvious advice ("get it from the machine that has it") is only half the
+ * story and is actively misleading when no machine has it: that was this app's
+ * only guidance during the 2026-09-22 incident, and it sent the user hunting for
+ * a machine that did not exist. What actually resolves it is changing the
+ * content so it hashes to a different address — and the non-obvious corollary,
+ * which costs real time to rediscover, is that re-committing the same bytes can
+ * never work, because Lore addresses fragments by content hash.
+ * @param {string} rp repository path
+ * @param {string[]} addresses `hash-context` strings the remote could not serve
+ * @param {string} [affectedFile] a file name already known to be involved
+ */
+async function unrecoverableContentMessage(rp, addresses, affectedFile) {
+  const lines = [
+    `This content is missing from the server AND from this machine, so there is nothing to push from here.`,
+    ...(affectedFile ? [`Affected file: ${affectedFile}`] : []),
+    `Address${addresses.length === 1 ? "" : "es"}: ${addresses.join(", ")}`,
+    ``,
+    `Two ways forward:`,
+    `1. Push from a machine that still holds it — normally the one that committed it.`,
+    `2. If no machine has it, the content itself has to change so it hashes differently.`,
+    `   Re-committing the same bytes will NOT work: fragments are addressed by content`,
+    `   hash, so identical content reproduces this same dead address every time.`,
+  ];
+
+  const uproject = unrealProjectFile(rp);
+  if (uproject) {
+    const assets = await unpushedUnrealAssets(rp);
+    lines.push(
+      ``,
+      `Unreal assets only need a resave to get fresh bytes:`,
+      `  UnrealEditor-Cmd.exe "${uproject}" -run=ResavePackages -PACKAGE=/Game/<Path> -unattended`,
+      `  (run from PowerShell — git-bash rewrites /Game/... so the commandlet matches nothing)`,
+    );
+    if (assets.length > 0) {
+      lines.push(`  Assets changed in the unpushed revision: ${assets.join(", ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * "Force Push": push, and if it fails because the remote is missing content
+ * this machine can actually supply, repair that content and retry once —
+ * a single action instead of the reactive flow (push, notice the failure,
+ * click "Push missing content", click Push again) the UI otherwise requires.
+ *
+ * There is no way to know which fragments a push will need *before* attempting
+ * it — that computation happens inside the native branchPush verb and isn't
+ * exposed — so "proactive" here means one click drives the full push→repair→
+ * retry sequence, not that repair happens ahead of the push attempt.
+ *
+ * Mirrors resetFilesStream's sync-and-retry shape: try the real op, detect the
+ * one recoverable failure signature, repair, retry once, then report whatever
+ * the retry produces (success or a fresh failure) rather than looping further.
+ * @param {string} rp repository path
+ * @param {{branch?: string, fastForwardMerge?: boolean}} args
+ * @returns {AsyncGenerator<import("./errors.mjs").LoreEvt>}
+ */
+async function* pushWithRepairStream(rp, args) {
+  let failure = null;
+  for await (const ev of stream("branchPush", { repositoryPath: rp }, args)) {
+    if (ev.tag !== "DONE") {
+      yield ev;
+    } else if (ev.data.ok) {
+      yield ev; // succeeded on the first attempt
+      return;
+    } else {
+      failure = ev.data.message;
+    }
+  }
+  if (!isAddressNotFoundMessage(failure)) {
+    yield { tag: "DONE", tagRaw: -1, data: { ok: false, status: -1, message: failure } };
+    return;
+  }
+  const missing = extractAddressNotFoundAddresses(failure);
+  if (missing.length === 0) {
+    // Matched the generic pattern but nothing parsed out of it — nothing to repair.
+    yield { tag: "DONE", tagRaw: -1, data: { ok: false, status: -1, message: failure } };
+    return;
+  }
+  yield {
+    tag: "LOG",
+    tagRaw: -1,
+    data: { level: "info", message: `Push refused: ${missing.length} address(es) missing on the remote. Checking whether this machine can supply them…` },
+  };
+  const available = await locallyAvailableAddresses(rp, missing);
+  const unsuppliable = missing.filter((a) => !available.has(`${a.hash}-${a.context}`));
+  if (unsuppliable.length > 0) {
+    const list = unsuppliable.map((a) => `${a.hash}-${a.context}`);
+    yield {
+      tag: "DONE",
+      tagRaw: -1,
+      data: { ok: false, status: -1, message: await unrecoverableContentMessage(rp, list) },
+    };
+    return;
+  }
+  yield { tag: "LOG", tagRaw: -1, data: { level: "info", message: `Re-uploading ${missing.length} address(es) this machine can supply…` } };
+  const results = await pushContent(rp, missing);
+  const failed = results.filter((r) => r.errorCode !== LoreErrorCode.NONE);
+  if (failed.length > 0) {
+    yield {
+      tag: "DONE",
+      tagRaw: -1,
+      data: {
+        ok: false,
+        status: -1,
+        message: `${failed.length} of ${missing.length} repair upload(s) failed: ${failed.map((r) => `${r.hash}-${r.context} (error ${r.errorCode})`).join(", ")}`,
+      },
+    };
+    return;
+  }
+  yield { tag: "LOG", tagRaw: -1, data: { level: "info", message: "Repair upload succeeded — retrying the push…" } };
+  yield* stream("branchPush", { repositoryPath: rp }, args);
+}
+
 /**
  * Run a content-reading verb (fileDiff, revisionInfo) on the fast local-only path
  * (offline), and if the needed content isn't in the local store
@@ -2197,8 +2358,10 @@ const server = createServer(async (req, res) => {
       return await streamOp(res, "revisionSync", { repositoryPath: rp }, { revision, reset: !!reset }, rp);
     }
     if (p === "/api/push" && req.method === "POST") {
-      const { path: rp, branch, fastForwardMerge } = await readBody(req);
-      return await streamOp(res, "branchPush", { repositoryPath: rp }, { branch, fastForwardMerge: !!fastForwardMerge }, rp);
+      const { path: rp, branch, fastForwardMerge, force } = await readBody(req);
+      const args = { branch, fastForwardMerge: !!fastForwardMerge };
+      if (force) return await pipeEvents(res, pushWithRepairStream(rp, args), rp, "branchPush");
+      return await streamOp(res, "branchPush", { repositoryPath: rp }, args, rp);
     }
     // Repair: push locally-held, not-yet-durable content to the remote (e.g.
     // after a commit whose upload timed out). Synchronous, not streamed — it's
