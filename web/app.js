@@ -1002,6 +1002,26 @@ function colorizeDiff(text) {
 async function commit() {
   const msg = $("#commit-msg").value.trim();
   if (!msg) return toast("Enter a commit message", true);
+
+  // Warn, don't block: a file already known to trigger a permanently-dead Lore
+  // fragment (see server/dead-fragments.mjs) is about to be committed. Catching
+  // it here means resaving before a bad revision exists, instead of after a
+  // failed push forces a branch-reset/recommit cycle to undo it. Best-effort --
+  // a failed check must never stop a commit the user could otherwise make.
+  try {
+    const { matches } = await apiPost("/api/dead-fragment-check", { path: state.active });
+    if (matches?.length > 0) {
+      const list = matches.map((m) => `  ${m.path} (${m.size} bytes) — blocked a push on ${new Date(m.firstSeen).toLocaleDateString()}`).join("\n");
+      const ok = confirm(
+        `${matches.length} file${matches.length === 1 ? "" : "s"} in this commit previously blocked a push with a dead Lore fragment:\n\n${list}\n\n` +
+          `Resaving the file (e.g. Unreal's ResavePackages) before committing avoids repeating that. Commit anyway?`
+      );
+      if (!ok) return;
+    }
+  } catch {
+    // Check failed -- proceed as if it found nothing.
+  }
+
   $("#commit-btn").disabled = true;
   try {
     // Only clear on success -- a failed commit that wiped the box would destroy
@@ -1623,13 +1643,15 @@ async function runOp(title, path, payload, opts = {}) {
     if (suppliable.length === 0) {
       // "Get it from the machine that has it" is only half the advice, and is
       // actively misleading when no machine has it — it sends the user hunting
-      // for a machine that does not exist. The rest of this text is the part
-      // that costs hours to rediscover: the content must change so it hashes
-      // differently, and re-committing identical bytes can never work because
-      // fragments are addressed by content hash. Keep in step with
-      // unrecoverableContentMessage() in server/index.mjs, which says the same
-      // thing for the Force Push path (and can also name the Unreal assets,
-      // which the browser cannot detect on its own).
+      // for a machine that does not exist. Corrected 2026-09-23: an earlier
+      // version of this text said the fix was changing content so it hashes
+      // differently. Disproved the same day — a revision that changed this
+      // file's CONTENT but kept its original SIZE hit the identical dead
+      // address. The fragment is a metadata block keyed by something like file
+      // size, not content hash. Keep in step with unrecoverableContentMessage()
+      // in server/index.mjs, which says the same thing for the Force Push path
+      // (and can also name the Unreal assets, which the browser cannot detect
+      // on its own).
       appendOpLog(
         logEl,
         `\nThis content is missing from the server AND from this machine, so there is nothing to push from here.\n` +
@@ -1637,10 +1659,10 @@ async function runOp(title, path, payload, opts = {}) {
           `Address${missing.length === 1 ? "" : "es"}: ${missing.join(", ")}\n` +
           `\nTwo ways forward:\n` +
           `1. Push from a machine that still holds it — normally the one that committed it.\n` +
-          `2. If no machine has it, the content itself has to change so it hashes differently.\n` +
-          `   Re-committing the same bytes will NOT work: fragments are addressed by content\n` +
-          `   hash, so identical content reproduces this same dead address every time.\n` +
-          `   For Unreal assets, a resave is enough to produce fresh bytes.\n`
+          `2. If no machine has it, one of the changed files has to change SIZE, not just\n` +
+          `   content — this fragment is a metadata block keyed by file size, so an edit\n` +
+          `   that happens to keep the same byte count reproduces this same dead address.\n` +
+          `   For Unreal assets, a resave reliably changes the saved file's size.\n`
       );
     }
 

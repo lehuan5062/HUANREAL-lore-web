@@ -21,6 +21,7 @@ import { sinceLaunch } from "./launch.mjs";
 // Pure frozen enums — this subpath has no imports of its own and does not touch koffi.
 import { LoreErrorCode } from "@lore-vcs/sdk/types/enums";
 import * as store from "./store.mjs";
+import { recordDeadSize, matchDeadSizes } from "./dead-fragments.mjs";
 import * as xform from "./transforms.mjs";
 import { addClient, broadcastRefresh, broadcastNotice } from "./events.mjs";
 import { watchRepo, unwatchRepo } from "./watcher.mjs";
@@ -1787,6 +1788,13 @@ async function pushContent(rp, addresses) {
 /** Unreal asset extensions — the files a resave can cheaply give fresh bytes to. */
 const UNREAL_ASSET_RE = /\.(umap|uasset)$/i;
 const UPROJECT_RE = /\.uproject$/i;
+/**
+ * Common source/text extensions — deliberately EXCLUDED from dead-fragment
+ * candidates. Verified 2026-09-22 by direct experiment: touching every text
+ * file's content in the failing commit left the dead address unchanged, so
+ * the culprit lives in the binary assets, never the source files.
+ */
+const TEXT_EXT_RE = /\.(cpp|h|hpp|cc|cs|c|ts|tsx|js|jsx|mjs|cjs|json|md|txt|ini|cfg|yml|yaml|toml|py|rb|go|rs|java|kt|swift|html|htm|css|scss|less|ps1|bat|sh|xml|csv|sql)$/i;
 
 /** The repo's `.uproject` file name, or null when this isn't an Unreal project. */
 function unrealProjectFile(rp) {
@@ -1798,31 +1806,44 @@ function unrealProjectFile(rp) {
 }
 
 /**
- * Unreal assets changed in the revision(s) this push could not deliver — the
- * shortlist of files a resave should target. Best-effort: any failure yields an
- * empty list, because this only enriches an error message and must never
- * replace one failure with another.
+ * Repository id plus the changed files in the revision(s) this push could not
+ * deliver, with their current on-disk size — the shortlist a resave should
+ * target, and what gets recorded into the dead-fragment registry. Best-effort:
+ * any failure yields an empty file list, because this only enriches an error
+ * message and must never replace one failure with another.
  * @param {string} rp repository path
- * @returns {Promise<string[]>} repo-relative asset paths
+ * @returns {Promise<{repositoryId: string|null, files: {path: string, size: number}[]}>}
  */
-async function unpushedUnrealAssets(rp) {
+async function unpushedFileInfo(rp) {
   try {
     // Deliberately NOT readArgs(): `offline: true` skips remote resolution, and
     // then revisionRemote comes back as the zero hash (measured), which would
     // make this silently return nothing every time. Reaching the server is safe
     // here — this only runs after a push already round-tripped to it.
     const statusEvents = await collect("repositoryStatus", { repositoryPath: rp }, { staged: false });
-    const remoteRevision = statusEvents.find((e) => e.tag === "REPOSITORY_STATUS_REVISION")?.data?.revisionRemote;
-    if (!remoteRevision || /^0+$/.test(remoteRevision)) return [];
+    const revData = statusEvents.find((e) => e.tag === "REPOSITORY_STATUS_REVISION")?.data;
+    const repositoryId = xform.repoSummary(statusEvents).repository ?? null;
+    const remoteRevision = revData?.revisionRemote;
+    if (!remoteRevision || /^0+$/.test(remoteRevision)) return { repositoryId, files: [] };
     // The diff itself is local-only, so offline is both correct and faster.
     const diffEvents = await collect("revisionDiff", readArgs(rp), { revisionSource: remoteRevision });
-    return xform
+    const paths = xform
       .diff(diffEvents)
       .map((d) => d?.path)
-      .filter((p) => typeof p === "string" && UNREAL_ASSET_RE.test(p));
+      .filter((p) => typeof p === "string");
+    const files = [];
+    for (const path of paths) {
+      try {
+        const info = await stat(join(rp, path));
+        files.push({ path, size: info.size });
+      } catch {
+        // Deleted or unreadable — nothing to resave, leave it out.
+      }
+    }
+    return { repositoryId, files };
   } catch (err) {
-    log.debug("could not list unpushed Unreal assets", { repo: rp, message: err instanceof Error ? err.message : String(err) });
-    return [];
+    log.debug("could not list unpushed files", { repo: rp, message: err instanceof Error ? err.message : String(err) });
+    return { repositoryId: null, files: [] };
   }
 }
 
@@ -1832,11 +1853,15 @@ async function unpushedUnrealAssets(rp) {
  *
  * The obvious advice ("get it from the machine that has it") is only half the
  * story and is actively misleading when no machine has it: that was this app's
- * only guidance during the 2026-09-22 incident, and it sent the user hunting for
- * a machine that did not exist. What actually resolves it is changing the
- * content so it hashes to a different address — and the non-obvious corollary,
- * which costs real time to rediscover, is that re-committing the same bytes can
- * never work, because Lore addresses fragments by content hash.
+ * only guidance during the 2026-09-22 incident, and it sent the user hunting
+ * for a machine that did not exist.
+ *
+ * What actually resolves it, corrected 2026-09-23 after the SAME address
+ * recurred on DIFFERENT content: the dead fragment is a file-metadata block
+ * keyed by something like file SIZE, not content hash. Changing content while
+ * keeping the same size (observed: an edited map that kept its original byte
+ * count) reproduces the identical dead address. Re-committing unchanged bytes
+ * is not even the risk here — an edit that happens to preserve size is enough.
  * @param {string} rp repository path
  * @param {string[]} addresses `hash-context` strings the remote could not serve
  * @param {string} [affectedFile] a file name already known to be involved
@@ -1849,23 +1874,32 @@ async function unrecoverableContentMessage(rp, addresses, affectedFile) {
     ``,
     `Two ways forward:`,
     `1. Push from a machine that still holds it — normally the one that committed it.`,
-    `2. If no machine has it, the content itself has to change so it hashes differently.`,
-    `   Re-committing the same bytes will NOT work: fragments are addressed by content`,
-    `   hash, so identical content reproduces this same dead address every time.`,
+    `2. If no machine has it, one of the changed files has to change SIZE, not just`,
+    `   content — this fragment is a metadata block keyed by file size, so an edit`,
+    `   that happens to keep the same byte count reproduces this same dead address.`,
   ];
+
+  const { repositoryId, files } = await unpushedFileInfo(rp);
+  const candidates = files.filter((f) => !TEXT_EXT_RE.test(f.path));
+  for (const f of candidates) {
+    for (const address of addresses) {
+      recordDeadSize(repositoryId, f.path, f.size, address, "not individually isolated — recorded alongside other files in the same failed push");
+    }
+  }
 
   const uproject = unrealProjectFile(rp);
   if (uproject) {
-    const assets = await unpushedUnrealAssets(rp);
-    lines.push(
-      ``,
-      `Unreal assets only need a resave to get fresh bytes:`,
-      `  UnrealEditor-Cmd.exe "${uproject}" -run=ResavePackages -PACKAGE=/Game/<Path> -unattended`,
-      `  (run from PowerShell — git-bash rewrites /Game/... so the commandlet matches nothing)`,
-    );
+    const assets = candidates.filter((f) => UNREAL_ASSET_RE.test(f.path));
+    lines.push(``, `A resave is the known fix — it reliably changes the saved file's size:`);
     if (assets.length > 0) {
-      lines.push(`  Assets changed in the unpushed revision: ${assets.join(", ")}`);
+      for (const a of assets) {
+        const gamePath = a.path.replace(/^Content\//i, "/Game/").replace(/\.(umap|uasset)$/i, "");
+        lines.push(`  UnrealEditor-Cmd.exe "${uproject}" -run=ResavePackages -PACKAGE=${gamePath} -unattended  # ${a.path} (${a.size} bytes)`);
+      }
+    } else {
+      lines.push(`  UnrealEditor-Cmd.exe "${uproject}" -run=ResavePackages -PACKAGE=/Game/<Path> -unattended`);
     }
+    lines.push(`  (run from PowerShell — git-bash rewrites /Game/... so the commandlet matches nothing)`);
   }
   return lines.join("\n");
 }
@@ -2350,6 +2384,31 @@ const server = createServer(async (req, res) => {
       const { path: rp, message } = await readBody(req);
       if (!message) return sendJson(res, 400, { error: "commit message required" });
       return await streamOp(res, "revisionCommit", { repositoryPath: rp }, { message }, rp);
+    }
+    // Pre-commit warning: has any currently staged (or about-to-be-staged) file
+    // returned to a size already known to trigger a permanently-dead Lore
+    // fragment on the remote? See dead-fragments.mjs. Checked against whatever
+    // `repositoryStatus` currently reports as changed, staged or not, since the
+    // UI calls this right before a stage-and-commit action -- catching it here
+    // means resaving BEFORE a bad revision exists, instead of after a failed
+    // push forces a branch-reset/recommit cycle to undo it.
+    if (p === "/api/dead-fragment-check" && req.method === "POST") {
+      const { path: rp } = await readBody(req);
+      if (!rp) return sendJson(res, 400, { error: "path required" });
+      try {
+        const statusEvents = await collect("repositoryStatus", readArgs(rp), { staged: false });
+        const repositoryId = xform.repoSummary(statusEvents).repository ?? null;
+        const files = statusEvents
+          .filter((e) => e.tag === "REPOSITORY_STATUS_FILE")
+          .map((e) => ({ path: e.data?.path, size: e.data?.size }))
+          .filter((f) => typeof f.path === "string" && Number.isFinite(f.size));
+        const matches = repositoryId ? matchDeadSizes(repositoryId, files) : [];
+        return sendJson(res, 200, { matches });
+      } catch (err) {
+        // Best-effort: never let this warning check itself block a commit.
+        log.debug("dead-fragment check failed", { repo: rp, message: err instanceof Error ? err.message : String(err) });
+        return sendJson(res, 200, { matches: [] });
+      }
     }
 
     // Remote operations stream their progress back as NDJSON.
